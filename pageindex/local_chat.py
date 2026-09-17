@@ -85,16 +85,50 @@ def _split_chat_messages(messages) -> "tuple[list[str], list[dict]]":
     return system_texts, history
 
 
+_SYNC_LOOP = None
+_SYNC_LOOP_LOCK = threading.Lock()
+
+
+class _SyncLoopThread:
+    def __init__(self) -> None:
+        self.loop = None
+        self._ready = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="pageindex-local-chat-loop",
+            daemon=True,
+        )
+        self._thread.start()
+        self._ready.wait()
+
+    def _run(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self.loop = loop
+        self._ready.set()
+        loop.run_forever()
+
+    def submit(self, awaitable):
+        return asyncio.run_coroutine_threadsafe(awaitable, self.loop)
+
+
+def _sync_loop_runner() -> _SyncLoopThread:
+    global _SYNC_LOOP
+    with _SYNC_LOOP_LOCK:
+        if _SYNC_LOOP is None or not _SYNC_LOOP._thread.is_alive():
+            _SYNC_LOOP = _SyncLoopThread()
+        return _SYNC_LOOP
+
+
 def _run_sync(coro):
-    from .utils import run_off_loop
-    return run_off_loop(asyncio.run, coro)
+    return _sync_loop_runner().submit(coro).result()
 
 
 _SENTINEL = object()
 
 
 def _stream_sync(agen_factory) -> Iterator[Any]:
-    """Drive an async generator from a background thread; yield synchronously.
+    """Drive an async generator from a pump thread on the shared loop.
 
     Closing the iterator cancels the run between items: the pump stops, and
     the async generator's cleanup cancels the underlying agent task, so no
@@ -103,6 +137,7 @@ def _stream_sync(agen_factory) -> Iterator[Any]:
     """
     items: "queue.Queue[Any]" = queue.Queue(maxsize=32)
     cancelled = threading.Event()
+    runner = _sync_loop_runner()
 
     def deliver(item) -> bool:
         while not cancelled.is_set():
@@ -140,7 +175,7 @@ def _stream_sync(agen_factory) -> Iterator[Any]:
                 await agen.aclose()
 
         try:
-            asyncio.run(consume())
+            runner.submit(consume()).result()
         except BaseException as exc:  # re-raised on the consumer thread
             deliver(exc)
             return

@@ -44,6 +44,31 @@ def client(store_path):
     return PageIndexLocalClient(storage_path=str(store_path))
 
 
+def test_run_sync_reuses_one_loop_across_calls():
+    async def running_loop():
+        return asyncio.get_running_loop()
+
+    first = local_chat._run_sync(running_loop())
+    second = local_chat._run_sync(running_loop())
+
+    assert second is first
+
+
+def test_stream_sync_reuses_run_sync_loop():
+    async def running_loop():
+        return asyncio.get_running_loop()
+
+    async def agen():
+        yield asyncio.get_running_loop()
+
+    run_loop = local_chat._run_sync(running_loop())
+    first_stream_loop = list(local_chat._stream_sync(agen))[0]
+    second_stream_loop = list(local_chat._stream_sync(agen))[0]
+
+    assert first_stream_loop is run_loop
+    assert second_stream_loop is run_loop
+
+
 # ── OpenAI engine fakes (chat_completions / responses) ──
 # Section-scoped skips: each engine's tests skip independently, so a
 # machine with only one extra installed still covers the other surface.
