@@ -196,13 +196,104 @@ class LocalAPI:
 
     @staticmethod
     def _extract_page_texts(file_path: str) -> list[str]:
+        """Per-page text extraction with a PDFium fallback.
+
+        PyPDF2 3.0.1 has two failure shapes that used to abort the whole
+        submit, and pypdfium2 parses the same files fine:
+          - per-page failures in extract_text(), e.g. UnboundLocalError
+            ("cannot access local variable 'cm'") from malformed ToUnicode
+            CMaps in _cmap.prepare_cm;
+          - document-level failures outside per-page text extraction, e.g.
+            TypeError ("argument of type 'FloatObject' is not iterable")
+            raised by PdfReader's page-tree _flatten on broken /Type entries.
+        PyPDF2 output is kept for every page it can read; individual failing
+        pages are re-read with pypdfium2, and a PyPDF2 that cannot even walk
+        the page tree falls back to reading every page with pypdfium2. Text
+        is scrubbed through _scrub_surrogates either way so lone surrogates
+        still cannot reach the JSON store.
+        """
         import PyPDF2
-        with open(file_path, "rb") as f:
-            reader = PyPDF2.PdfReader(f)
-            # PyPDF2 decodes broken ToUnicode maps with surrogatepass; lone
-            # surrogates would crash every utf-8 JSON save downstream.
-            return [_scrub_surrogates(page.extract_text() or "")
-                    for page in reader.pages]
+
+        import pypdfium2 as pdfium
+
+        texts: list[str | None] | None = None
+        failed: list[int] = []
+        try:
+            with open(file_path, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                texts = []
+                for index, page in enumerate(reader.pages):
+                    try:
+                        text = page.extract_text()
+                    except Exception as exc:
+                        logger.warning(
+                            "PyPDF2 text extraction failed on page %d of %s "
+                            "(%s: %s); re-reading that page with PDFium",
+                            index + 1, file_path, type(exc).__name__, exc,
+                        )
+                        texts.append(None)
+                        failed.append(index)
+                        continue
+                    # PyPDF2 decodes broken ToUnicode maps with surrogatepass;
+                    # lone surrogates would crash every utf-8 JSON save.
+                    texts.append(_scrub_surrogates(text or ""))
+        except Exception as exc:
+            logger.warning(
+                "PyPDF2 failed to walk %s (%s: %s); reading all pages "
+                "with PDFium",
+                file_path, type(exc).__name__, exc,
+            )
+            texts = None
+        if texts is None:
+            doc = pdfium.PdfDocument(file_path)
+            try:
+                texts = []
+                for index in range(len(doc)):
+                    try:
+                        textpage = doc[index].get_textpage()
+                        try:
+                            texts.append(_scrub_surrogates(
+                                textpage.get_text_range() or ""
+                            ))
+                        finally:
+                            textpage.close()
+                    except Exception as exc:
+                        # Broken page objects can fail PDFium's page load too
+                        # ("Failed to load page"); the page is unreadable by
+                        # any parser, so it contributes empty text.
+                        logger.warning(
+                            "PDFium could not read page %d of %s (%s)",
+                            index + 1, file_path, exc,
+                        )
+                        texts.append("")
+            finally:
+                doc.close()
+            return texts
+        if failed:
+            doc = pdfium.PdfDocument(file_path)
+            try:
+                total_pages = len(doc)
+                for index in failed:
+                    if index >= total_pages:
+                        texts[index] = ""
+                        continue
+                    try:
+                        textpage = doc[index].get_textpage()
+                        try:
+                            texts[index] = _scrub_surrogates(
+                                textpage.get_text_range() or ""
+                            )
+                        finally:
+                            textpage.close()
+                    except Exception as exc:
+                        logger.warning(
+                            "PDFium could not read page %d of %s (%s)",
+                            index + 1, file_path, exc,
+                        )
+                        texts[index] = ""
+            finally:
+                doc.close()
+        return [text or "" for text in texts]
 
     def _index_standard(self, file_path: str, page_texts: list[str]) -> tuple[list, str | None]:
         from .page_index_classic import page_index_main

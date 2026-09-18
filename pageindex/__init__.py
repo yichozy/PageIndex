@@ -50,3 +50,12 @@ def __getattr__(name):
 
 def __dir__():
     return sorted(set(globals()) | set(__all__) | _SUBMODULES)
+
+
+# PDFium's FFI is not thread-safe; wrap PdfDocument so any embedding (this
+# package's pipelines included) that opens documents from multiple threads
+# is serialized for the whole document lifetime. Runs here — before any
+# submodule, including lazily imported flash, can touch pypdfium2. See
+# pageindex/_pdfium_lock.py; PAGEINDEX_DISABLE_PDFIUM_LOCK=1 opts out.
+from ._pdfium_lock import apply as _apply_pdfium_lock
+_apply_pdfium_lock()

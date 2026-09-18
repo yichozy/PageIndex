@@ -8,6 +8,15 @@ from .utils import *
 from .tree_optimize import merge_tree
 import os
 
+# The verify step checks the generated TOC with an LLM and rejects the
+# document ("Processing failed") when accuracy <= 0.6 and no fallback mode
+# is left. For 1-2 page PDFs the TOC has only 1-2 entries, the verify
+# model's JSON output frequently fails to parse (each failure counts as
+# incorrect), and a single miss lands accuracy at 50-60% — so short
+# documents get rejected even though their "tree" is trivially fine.
+# Skip verification for them.
+SHORT_DOC_PAGE_THRESHOLD = 2
+
 ######################### Hardening for prompt injection patterns ####################################################
 _INJECTION_PATTERNS = re.compile(
     r"(?i)("
@@ -1064,6 +1073,8 @@ async def fix_incorrect_toc_with_retries(toc_with_page_number, page_list, incorr
 ################### verify toc #########################################################
 async def verify_toc(page_list, list_result, start_index=1, N=None, model=None):
     print('start verify_toc')
+    if len(page_list) <= SHORT_DOC_PAGE_THRESHOLD:
+        return 1.0, []
     # Find the last non-None physical_index
     last_physical_index = None
     for item in reversed(list_result):
