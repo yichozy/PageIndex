@@ -893,7 +893,8 @@ def test_blank_pdf_rejected(local_client, tmp_path):
     from conftest import build_pdf
     blank = tmp_path / "blank.pdf"
     blank.write_bytes(build_pdf(["", ""]))
-    with pytest.raises(PageIndexAPIError, match="All pages are blank"):
+    with pytest.raises(PageIndexAPIError,
+                     match=r"all pages are blank.*mode='standard'"):
         local_client.submit_document(str(blank))
 
 

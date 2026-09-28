@@ -637,8 +637,13 @@ class PageIndexClient:
         refined for retrieval (a deterministic merge, then an LLM expansion
         pass); node summaries, the expansion pass, and the document
         description use ``summary_model``. Pass ``mode="standard"`` for a
-        full LLM-built tree (slower). ``beta_headers`` and ``folder_id`` are
-        cloud-only.
+        full LLM-built tree (slower). Standard mode also runs a vision
+        pre-pass: sparse pages (thin text or a large image footprint,
+        including pure scanned PDFs) are rendered and the multimodal
+        ``model`` extracts what the text layer is missing (headings,
+        figure captions, tables); the result feeds only the tree build,
+        stored page text is untouched. ``beta_headers`` and ``folder_id``
+        are cloud-only.
 
         Args:
             file_path (str): Path to the PDF file.

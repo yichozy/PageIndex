@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "pageindex"
-version = "0.2.18"
+version = "0.2.19"
 description = "Python SDK for PageIndex — reasoning-based, vectorless document retrieval, cloud and local"
 readme = "README.md"
 license = "MIT"
@@ -36,6 +36,8 @@ mcp = ">=1.19.0,<3"
 litellm = ">=1.97.0"
 PyPDF2 = ">=3.0.0"
 pypdfium2 = ">=5"
+# Vision pre-pass page rendering (pageindex.vision).
+pillow = ">=10"
 sortedcontainers = ">=2.4.0"
 regex = ">=2024.0.0"
 python-dotenv = ">=1.0.0"

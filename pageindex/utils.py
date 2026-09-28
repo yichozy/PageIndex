@@ -158,7 +158,8 @@ def _is_unrecoverable(exc: Exception) -> bool:
     return getattr(exc, "status_code", None) in _UNRECOVERABLE_STATUS
 
 
-def llm_completion(model, prompt, chat_history=None, return_finish_reason=False):
+def llm_completion(model, prompt, chat_history=None, return_finish_reason=False,
+                   timeout=None):
     import litellm
     max_retries = 10
     messages = list(chat_history) + [{"role": "user", "content": prompt}] if chat_history else [{"role": "user", "content": prompt}]
@@ -174,6 +175,7 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                 "drop_params": True,
                 # the loop is the retry policy; the merge lets a backend override win
                 "max_retries": 0,
+                **({"timeout": timeout} if timeout is not None else {}),
                 **(backend or {}),
             })
             content = response.choices[0].message.content

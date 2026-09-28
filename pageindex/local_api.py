@@ -113,9 +113,12 @@ class LocalAPI:
             raise PageIndexAPIError(
                 f"Failed to submit document: could not read PDF: {e}"
             ) from e
-        if not any(text.strip() for text in page_texts):
+        # Standard mode's vision pre-pass can index blank-page documents
+        # (pure scans); flash has no such recovery path.
+        if not any(text.strip() for text in page_texts) and mode != "standard":
             raise PageIndexAPIError(
-                "Failed to submit document: PDF has no content. All pages are blank."
+                "Failed to submit document: all pages are blank. "
+                "Try mode='standard'."
             )
         # Surrogates from a surrogateescape'd filesystem name would be
         # mangled by the store's errors="replace" write; scrub now so the
@@ -130,7 +133,7 @@ class LocalAPI:
                 )
             else:
                 structure, description = run_off_loop(
-                    self._with_backend, self._index_standard, file_path,
+                    self._with_backend, self._index_standard_maybe_vision, file_path,
                     page_texts
                 )
         except PageIndexAPIError:
@@ -315,6 +318,30 @@ class LocalAPI:
                 "Failed to submit document: standard indexing produced no structure."
             )
         return structure, result.get("doc_description")
+
+    def _index_standard_maybe_vision(self, file_path: str,
+                                     page_texts: list[str]
+                                     ) -> tuple[list, str | None]:
+        """Standard indexing, always attempting the vision pre-pass.
+
+        ``build_texts`` (original text plus per-sparse-page vision
+        transcriptions) feeds only the tree build; the caller keeps
+        storing the original ``page_texts``. Sparse-page detection
+        happens inside ``transcribe_sparse_pages`` — documents without
+        sparse pages pay only the local detection cost and index
+        exactly as before. The pre-pass is best-effort: any failure
+        falls back to text-only indexing.
+        """
+        build_texts = page_texts
+        from .vision import transcribe_sparse_pages
+        try:
+            build_texts = transcribe_sparse_pages(
+                file_path, page_texts, model=self._model)
+        except Exception as e:
+            logger.warning(
+                "vision pre-pass failed; falling back to text-only "
+                "indexing: %s", e)
+        return self._index_standard(file_path, build_texts)
 
     def _index_flash(self, file_path: str) -> tuple[list, str | None]:
         from .flash import page_index_flash
