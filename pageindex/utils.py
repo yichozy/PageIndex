@@ -175,6 +175,10 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False,
                 "drop_params": True,
                 # the loop is the retry policy; the merge lets a backend override win
                 "max_retries": 0,
+                # extraction must be reproducible: without this the provider
+                # default (DeepSeek: 1.0) re-rolls every TOC extraction, making
+                # verify_toc's 60% gate a coin flip on borderline documents
+                "temperature": 0,
                 **({"timeout": timeout} if timeout is not None else {}),
                 **(backend or {}),
             })
@@ -212,6 +216,8 @@ async def llm_acompletion(model, prompt):
                 "messages": messages,
                 "drop_params": True,
                 "max_retries": 0,
+                # same rationale as llm_completion: deterministic extraction
+                "temperature": 0,
                 **(backend or {}),
             })
             return response.choices[0].message.content

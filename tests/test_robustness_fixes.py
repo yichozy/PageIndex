@@ -134,3 +134,79 @@ def _fake_pdfium(page_texts):
 
     fake.PdfDocument = FakePdfDocument
     return fake
+
+
+def test_add_page_offset_tolerates_unmatched_toc_titles():
+    """Regression: int + None TypeError when TOC titles never match.
+
+    extract_matching_page_pairs pairs items by exact title equality across two
+    LLM extractions; when no title matches, calculate_page_offset returns None
+    and add_page_offset_to_toc_json used to raise
+    "unsupported operand type(s) for +: 'int' and 'NoneType'".
+    """
+    from pageindex.page_index_classic import (
+        add_page_offset_to_toc_json,
+        calculate_page_offset,
+        extract_matching_page_pairs,
+    )
+
+    # Title variance between the two extractions -> no pairs.
+    pairs = extract_matching_page_pairs(
+        [{"title": "Intro", "page": 3}],
+        [{"title": "Introduction", "physical_index": 5}],
+        start_page_index=4,
+    )
+    assert pairs == []
+    assert calculate_page_offset(pairs) is None
+
+    toc = [{"title": "Intro", "page": 3}, {"title": "Methods", "page": 10}]
+    # A None offset must leave items untouched, not crash.
+    result = add_page_offset_to_toc_json([dict(i) for i in toc], None)
+    assert result == toc
+
+    # Sanity: a valid offset still applies and consumes the page field.
+    applied = add_page_offset_to_toc_json([dict(i) for i in toc], 2)
+    assert applied == [
+        {"title": "Intro", "physical_index": 5},
+        {"title": "Methods", "physical_index": 12},
+    ]
+
+
+def test_llm_completion_pins_temperature_zero(monkeypatch):
+    """Indexing extraction must be deterministic: temperature=0 reaches
+    litellm. Without it the provider default (DeepSeek: 1.0) re-rolls every
+    TOC extraction, turning verify_toc's 60% gate into a coin flip."""
+    import litellm
+    from types import SimpleNamespace
+
+    import pageindex.utils
+
+    captured = {}
+
+    def fake_completion(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    assert pageindex.utils.llm_completion("gpt-4o", "probe") == "ok"
+    assert captured["temperature"] == 0
+    assert captured["max_retries"] == 0
+
+
+def test_llm_acompletion_pins_temperature_zero(monkeypatch):
+    import litellm
+    from types import SimpleNamespace
+
+    import pageindex.utils
+
+    captured = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    assert asyncio.run(pageindex.utils.llm_acompletion("gpt-4o", "probe")) == "ok"
+    assert captured["temperature"] == 0
