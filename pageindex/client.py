@@ -648,8 +648,10 @@ class PageIndexClient:
         Args:
             file_path (str): Path to the PDF file.
             mode (str, optional): Processing mode. Local defaults to "flash";
-                pass "standard" for a full LLM-built tree. Cloud modes are
-                passed through (e.g. "mcp").
+                pass "standard" for a full LLM-built tree, or "toc"
+                (local-only) to build the tree directly from the PDF
+                bookmark outline with chapter page ranges and no summaries.
+                Cloud modes are passed through (e.g. "mcp").
             beta_headers (list[str], optional): Cloud-only beta feature headers.
             folder_id (str, optional): Cloud-only folder (workspace) ID.
             metadata (dict, optional): Your own JSON-serializable tags for the

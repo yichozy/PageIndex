@@ -59,6 +59,11 @@ class CloudAPI:
                 (a taken name gains a numeric suffix), when the server
                 returns it.
         """
+        if mode == "toc":
+            raise PageIndexAPIError(
+                "Failed to submit document: mode='toc' is local-only; the "
+                "cloud API does not build trees from PDF bookmark outlines."
+            )
         data: Dict[str, Any] = {'if_retrieval': True}
         if mode is not None:
             data['mode'] = mode

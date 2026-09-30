@@ -90,10 +90,10 @@ class LocalAPI:
                 raise PageIndexAPIError(
                     f"Failed to submit document: metadata must be valid JSON. {e}"
                 ) from e
-        if mode not in (None, "standard", "flash"):
+        if mode not in (None, "standard", "flash", "toc"):
             raise PageIndexAPIError(
                 f"Failed to submit document: unknown local processing mode {mode!r}. "
-                "Supported: 'flash' (default) or 'standard'."
+                "Supported: 'flash' (default), 'standard', or 'toc'."
             )
         if mode is None:
             mode = "flash"
@@ -114,8 +114,10 @@ class LocalAPI:
                 f"Failed to submit document: could not read PDF: {e}"
             ) from e
         # Standard mode's vision pre-pass can index blank-page documents
-        # (pure scans); flash has no such recovery path.
-        if not any(text.strip() for text in page_texts) and mode != "standard":
+        # (pure scans), and toc mode reads the bookmark outline instead of
+        # the text layer; flash has no such recovery path.
+        if not any(text.strip() for text in page_texts) and mode not in (
+                "standard", "toc"):
             raise PageIndexAPIError(
                 "Failed to submit document: all pages are blank. "
                 "Try mode='standard'."
@@ -130,6 +132,10 @@ class LocalAPI:
             if mode == "flash":
                 structure, description = run_off_loop(
                     self._with_backend, self._index_flash, file_path
+                )
+            elif mode == "toc":
+                structure, description = run_off_loop(
+                    self._with_backend, self._index_toc, file_path, page_texts
                 )
             else:
                 structure, description = run_off_loop(
@@ -297,6 +303,29 @@ class LocalAPI:
             finally:
                 doc.close()
         return [text or "" for text in texts]
+
+    def _index_toc(self, file_path: str,
+                   page_texts: list[str]) -> tuple[list, str | None]:
+        """Build the tree purely from the PDF bookmark outline (mode='toc').
+
+        Zero LLM calls: the outline goes through the same validate/classify
+        gate flash uses, then is nested as-is. Nodes carry no summaries and
+        the document gets no description.
+        """
+        from .flash.embedded_toc import (IGNORE, bookmarks_to_structure,
+                                         classify_bookmarks, read_bookmarks,
+                                         validate_bookmarks)
+        n_pages = len(page_texts)
+        validated = validate_bookmarks(read_bookmarks(file_path), n_pages)
+        if (not validated
+                or classify_bookmarks(validated, n_pages) == IGNORE):
+            raise PageIndexAPIError(
+                "Failed to submit document: no usable PDF bookmark outline "
+                "(mode='toc'). The document has no PDF bookmarks, or they are "
+                "too untrustworthy (too few, generic, or out of order) to "
+                "build a tree from."
+            )
+        return bookmarks_to_structure(validated, n_pages), None
 
     def _index_standard(self, file_path: str, page_texts: list[str]) -> tuple[list, str | None]:
         from .page_index_classic import page_index_main
