@@ -13,7 +13,9 @@ without sparse pages pay only the local detection cost and index
 exactly as before.
 
 The stage never fails a submission: LocalAPI catches everything from
-``transcribe_sparse_pages`` and falls back to text-only indexing.
+``transcribe_sparse_pages`` and falls back to text-only indexing. The
+pdfium work itself runs in a disposable child process (see
+``_detect_and_render_guarded``).
 """
 from __future__ import annotations
 
@@ -21,9 +23,11 @@ import base64
 import contextvars
 import io
 import logging
+import multiprocessing
 import os
 import re
 import concurrent.futures
+from concurrent.futures import ProcessPoolExecutor
 from typing import Any
 
 from .utils import count_tokens, llm_completion
@@ -97,8 +101,10 @@ def page_image_area_ratio(doc: Any, index: int) -> float:
     """
     import pypdfium2.raw as pdfium_c
 
-    page = doc[index]
     try:
+        # doc[index] itself can raise for a damaged page object; keep it
+        # inside the try so detection never aborts the whole pre-pass.
+        page = doc[index]
         page_width, page_height = page.get_size()
         page_area = page_width * page_height
         if page_area <= 0:
@@ -149,6 +155,68 @@ def transcribe_page(model: str | None, page_text: str,
     return match.group(1).strip()
 
 
+def _detect_and_render(file_path: str,
+                       page_texts: list[str]) -> tuple[list[int], dict[int, str]]:
+    """All pdfium work of the pre-pass: sparse detection + page rendering.
+
+    This function is the subprocess target of
+    :func:`_detect_and_render_guarded`: it is expected to die natively
+    on documents pdfium cannot survive. Pages that fail cleanly
+    (``PdfiumError`` on load/render) are skipped individually — they
+    are permanently untranscribable but say nothing about the model.
+    """
+    import pypdfium2 as pdfium
+
+    doc = pdfium.PdfDocument(file_path)
+    try:
+        sparse: list[int] = []
+        for index in range(len(page_texts)):
+            if is_sparse_page(page_texts[index],
+                              page_image_area_ratio(doc, index)):
+                sparse.append(index)
+        renders: dict[int, str] = {}
+        for index in sparse:
+            try:
+                renders[index] = render_page_jpeg(doc, index)
+            except Exception as exc:
+                logger.warning(
+                    "vision pre-pass: page %d cannot be rendered (%s: %s); "
+                    "skipping its transcription",
+                    index + 1, type(exc).__name__, exc)
+    finally:
+        doc.close()
+    return sparse, renders
+
+
+def _detect_and_render_guarded(
+        file_path: str,
+        page_texts: list[str]) -> tuple[list[int], dict[int, str]] | None:
+    """Run :func:`_detect_and_render` in a disposable child process.
+
+    Damaged documents can crash pdfium natively (SIGSEGV), which Python
+    cannot catch: the work runs in a spawned single-worker pool whose
+    death (``BrokenProcessPool``) the parent merely observes, returning
+    ``None`` so the stage degrades to text-only indexing. The parent
+    cannot intercept the segfault itself; it only sees the pool failure.
+    """
+    try:
+        # Reuse flash's spawn guard: spawn re-executes the caller's
+        # __main__ in the child, which for the service entrypoint would
+        # re-run module-level server startup.
+        from .flash.parser_pdfium_parallel import _anonymous_main
+
+        with _anonymous_main(), ProcessPoolExecutor(
+                max_workers=1,
+                mp_context=multiprocessing.get_context("spawn")) as executor:
+            return executor.submit(_detect_and_render,
+                                   file_path, page_texts).result()
+    except Exception as exc:
+        logger.warning(
+            "vision pre-pass: pdfium child failed (%s: %s); building from "
+            "the text layer only", type(exc).__name__, exc)
+        return None
+
+
 def transcribe_sparse_pages(file_path: str, page_texts: list[str],
                             model: str | None = None) -> list[str]:
     """Visually transcribe the document's sparse pages.
@@ -161,31 +229,31 @@ def transcribe_sparse_pages(file_path: str, page_texts: list[str],
     transcribed pages — one entry per input page, transcriptions only
     ever appended.
 
-    Failure semantics: if page calls fail and not a single one has
-    succeeded, the stage is treated as broken (unsupported model,
-    unreachable endpoint) and raises :class:`VisionStageError` without
-    launching further calls. After any success, an individual page
-    failure just leaves that page without a transcription.
+    Failure semantics: all pdfium work runs in a disposable child
+    process; if that child fails or dies natively (a damaged document
+    can segfault pdfium), the stage degrades to text-only indexing.
+    Pages that fail cleanly (pdfium cannot load/render them) are
+    skipped individually. For the model calls: if they fail and not a
+    single one has succeeded, the stage is treated as broken
+    (unsupported model, unreachable endpoint) and raises
+    :class:`VisionStageError` without launching further calls. After
+    any success, an individual page failure just leaves that page
+    without a transcription.
     """
-    import pypdfium2 as pdfium
-
-    total = len(page_texts)
-    doc = pdfium.PdfDocument(file_path)
-    try:
-        sparse: list[int] = []
-        for index in range(total):
-            if is_sparse_page(page_texts[index],
-                              page_image_area_ratio(doc, index)):
-                sparse.append(index)
-        renders = {index: render_page_jpeg(doc, index)
-                   for index in sparse}
-    finally:
-        doc.close()
+    detected = _detect_and_render_guarded(file_path, page_texts)
+    if detected is None:
+        return list(page_texts)
+    sparse, renders = detected
     if not sparse:
         logger.info("vision pre-pass: no sparse pages")
         return list(page_texts)
+    if not renders:
+        logger.warning("vision pre-pass: no sparse page could be rendered")
+        return list(page_texts)
+    renderable = sorted(renders)
+    total = len(page_texts)
     logger.info("vision pre-pass: transcribing %d of %d pages",
-                len(sparse), total)
+                len(renderable), total)
 
     transcripts: dict[int, str] = {}
     # The indexing lane's connection overrides ride a contextvar set in
@@ -199,9 +267,9 @@ def transcribe_sparse_pages(file_path: str, page_texts: list[str],
     try:
         futures = {index: pool.submit(ctx.copy().run, transcribe_page, model,
                                       page_texts[index], renders[index])
-                   for index in sparse}
+                   for index in renderable}
         any_success = False
-        for index in sparse:
+        for index in renderable:
             try:
                 transcripts[index] = futures[index].result()
                 any_success = True

@@ -14,6 +14,24 @@ from pageindex.local_api import LocalAPI
 PAGE_TEXTS = ["Hello page one about apples", "Second page about bananas"]
 
 
+@pytest.fixture(autouse=True)
+def _pdfium_in_process(monkeypatch, request):
+    """Run the pre-pass's pdfium work in-process.
+
+    In production ``_detect_and_render`` executes in a spawn child; a
+    child re-imports pageindex.vision fresh, so the monkeypatched
+    primitives below would not apply there (and per-test spawning would
+    be slow). Tests exercise ``_detect_and_render`` directly; the guarded
+    wrapper gets its own dedicated tests, marked ``real_guard`` to keep
+    the production wrapper in place.
+    """
+    if request.node.get_closest_marker("real_guard"):
+        return
+    monkeypatch.setattr(vision_mod, "_detect_and_render_guarded",
+                        lambda fp, texts:
+                        vision_mod._detect_and_render(fp, texts))
+
+
 def _make_api(tmp_path):
     return LocalAPI(str(tmp_path / "storage"), model="test-model",
                     summary_model="test-model")
@@ -433,3 +451,79 @@ def test_blank_pdf_still_rejected_in_flash_mode(tmp_path):
     with pytest.raises(PageIndexAPIError,
                        match=r"all pages are blank.*mode='standard'"):
         api.submit_document(str(path), mode="flash")
+
+
+def test_render_failure_skips_only_that_page(monkeypatch, sample_pdf):
+    # A damaged page (pdfium cannot load/render it) is page-local damage:
+    # it must be skipped without aborting transcription for the document's
+    # other sparse pages (regression: one broken page poisoned the whole
+    # stage at render time, before any model call).
+    monkeypatch.setattr(vision_mod, "count_tokens", _zero_tokens)
+
+    def fake_render(doc, index):
+        if index == 0:
+            raise RuntimeError("Failed to load page.")
+        return f"data:img{index}"
+
+    monkeypatch.setattr(vision_mod, "render_page_jpeg", fake_render)
+
+    def fake_transcribe(model, page_text, image_data_url):
+        return "recovered transcript"
+
+    monkeypatch.setattr(vision_mod, "transcribe_page", fake_transcribe)
+    out = vision_mod.transcribe_sparse_pages(sample_pdf, PAGE_TEXTS)
+    assert len(out) == len(PAGE_TEXTS)
+    assert "<page-vision>" not in out[0]
+    assert "<page-vision>\nrecovered transcript\n</page-vision>" in out[1]
+
+
+# ── subprocess isolation ──
+
+
+def test_child_death_degrades_to_text_only(monkeypatch, sample_pdf):
+    # A native pdfium crash kills the child (the guard returns None);
+    # the pre-pass must then return the texts unchanged — no VLM call,
+    # no exception to the caller.
+    monkeypatch.setattr(vision_mod, "_detect_and_render_guarded",
+                        lambda fp, texts: None)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("no VLM call expected after child death")
+
+    monkeypatch.setattr(vision_mod, "transcribe_page", fail)
+    assert vision_mod.transcribe_sparse_pages(sample_pdf, PAGE_TEXTS) == PAGE_TEXTS
+
+
+@pytest.mark.real_guard
+def test_guard_returns_none_when_pool_breaks(monkeypatch, sample_pdf):
+    # A segfaulting child surfaces as BrokenProcessPool; the guard must
+    # swallow it and report None (not raise) so the stage degrades.
+    from concurrent.futures.process import BrokenProcessPool
+
+    class _BrokenPool:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def submit(self, *args, **kwargs):
+            raise BrokenProcessPool("child died")
+
+    monkeypatch.setattr(vision_mod, "ProcessPoolExecutor", _BrokenPool)
+    assert vision_mod._detect_and_render_guarded(sample_pdf, PAGE_TEXTS) is None
+
+
+@pytest.mark.real_guard
+def test_guard_runs_detection_in_real_child(sample_pdf):
+    # End-to-end spawn check: the guard's child must import the package,
+    # open the document, and return (sparse, renders) through the pool.
+    dense = " ".join(["word"] * 40)
+    sparse_list, renders = vision_mod._detect_and_render_guarded(
+        sample_pdf, [dense, dense])
+    # conftest's sample_pdf is two text-only pages: nothing sparse.
+    assert sparse_list == []
+    assert renders == {}

@@ -56,6 +56,11 @@ anthropic = ["anthropic"]
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.0"
 
+[tool.pytest.ini_options]
+markers = [
+    "real_guard: test runs the production subprocess-guarded pdfium path (spawns a real child)",
+]
+
 [tool.poetry.urls]
 Repository = "https://github.com/VectifyAI/PageIndex"
 Homepage = "https://pageindex.ai"
