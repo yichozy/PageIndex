@@ -173,7 +173,7 @@ def test_transcribe_assembly_alignment(monkeypatch, sample_pdf):
     monkeypatch.setattr(vision_mod, "render_page_jpeg",
                         lambda doc, index: f"data:img{index}")
 
-    def fake_transcribe(model, page_text, image_data_url):
+    def fake_transcribe(model, page_text, image_data_url, garbled=False):
         if image_data_url == "data:img0":
             return "1. Heading Alpha\n[Figure: chart]"
         return ""  # page 2 adds nothing
@@ -195,7 +195,7 @@ def test_first_failure_aborts_stage(monkeypatch, sample_pdf):
     monkeypatch.setattr(vision_mod, "render_page_jpeg",
                         lambda doc, index: f"data:img{index}")
 
-    def fake_transcribe(model, page_text, image_data_url):
+    def fake_transcribe(model, page_text, image_data_url, garbled=False):
         if image_data_url == "data:img0":
             raise RuntimeError("model does not support images")
         return "transcript one"
@@ -218,7 +218,7 @@ def test_abort_cancels_pending_calls(monkeypatch, tmp_path):
                         lambda doc, index: f"data:img{index}")
     calls = []
 
-    def fake_transcribe(model, page_text, image_data_url):
+    def fake_transcribe(model, page_text, image_data_url, garbled=False):
         calls.append(image_data_url)
         if image_data_url == "data:img0":
             raise RuntimeError("boom")
@@ -246,7 +246,7 @@ def test_transcribe_threads_inherit_llm_backend(monkeypatch, sample_pdf):
     seen = {}
     barrier = threading.Barrier(2, timeout=5)
 
-    def fake_transcribe(model, page_text, image_data_url):
+    def fake_transcribe(model, page_text, image_data_url, garbled=False):
         seen.setdefault("backend", _llm_backend.get())
         try:
             barrier.wait()
@@ -269,7 +269,7 @@ def test_single_page_failure_skips_that_page(monkeypatch, sample_pdf):
     monkeypatch.setattr(vision_mod, "render_page_jpeg",
                         lambda doc, index: f"data:img{index}")
 
-    def fake_transcribe(model, page_text, image_data_url):
+    def fake_transcribe(model, page_text, image_data_url, garbled=False):
         if image_data_url == "data:img0":
             return "transcript zero"
         raise RuntimeError("transient")
@@ -289,7 +289,7 @@ def test_no_page_cap_all_sparse_processed(monkeypatch, tmp_path):
     monkeypatch.setattr(vision_mod, "render_page_jpeg",
                         lambda doc, index: f"data:img{index}")
     monkeypatch.setattr(vision_mod, "transcribe_page",
-                        lambda model, text, image: f"cap {image}")
+                        lambda model, text, image, garbled=False: f"cap {image}")
     out = vision_mod.transcribe_sparse_pages(str(path),
                                        [f"page {i}" for i in range(n)])
     assert len(out) == n
@@ -467,7 +467,7 @@ def test_render_failure_skips_only_that_page(monkeypatch, sample_pdf):
 
     monkeypatch.setattr(vision_mod, "render_page_jpeg", fake_render)
 
-    def fake_transcribe(model, page_text, image_data_url):
+    def fake_transcribe(model, page_text, image_data_url, garbled=False):
         return "recovered transcript"
 
     monkeypatch.setattr(vision_mod, "transcribe_page", fake_transcribe)
@@ -475,6 +475,135 @@ def test_render_failure_skips_only_that_page(monkeypatch, sample_pdf):
     assert len(out) == len(PAGE_TEXTS)
     assert "<page-vision>" not in out[0]
     assert "<page-vision>\nrecovered transcript\n</page-vision>" in out[1]
+
+
+# ── garbled text layer ──
+
+
+# Glyph-id leakage from a subset font without ToUnicode (real excerpt
+# shape of [PROTOCOL]NCT05053230.pdf's TOC page): dense, printable, and
+# unreadable — letters are almost absent among non-whitespace chars.
+CIPHER_PAGE = ("#$%\t&'()(*(+\t,-../'0\t/123('\t,*45./\t$$$$$$$$ 6\t"
+               "7$% (895*):;5,\t/12\t,*:51):<:*\t/:.,\t$$$$$$$$$$$$$$ =\t"
+               ) * 3
+PROSE_PAGE = ("This clinical study protocol describes a randomized "
+              "controlled trial of the study drug in participants with "
+              "advanced ovarian cancer. The study has two arms.")
+CJK_PAGE = ("本临床试验方案旨在评估研究药物在晚期卵巢癌受试者中的安全性和有效性。"
+            "受试者将按一比一比例随机分配至两个治疗组。" * 3)
+
+
+def test_garbled_page_detection(monkeypatch):
+    monkeypatch.delenv("PAGEINDEX_VISION_GARBLED_LETTER_SHARE", raising=False)
+    monkeypatch.delenv("PAGEINDEX_VISION_GARBLED_MIN_CHARS", raising=False)
+    assert vision_mod.is_garbled_page(CIPHER_PAGE) is True
+    assert vision_mod.is_garbled_page(PROSE_PAGE) is False
+    assert vision_mod.is_garbled_page(CJK_PAGE) is False   # CJK isalpha
+    assert vision_mod.is_garbled_page(" #$%&'() 123456") is False  # < min chars
+
+
+def test_document_garbled_median_gate(monkeypatch):
+    monkeypatch.delenv("PAGEINDEX_VISION_GARBLED_LETTER_SHARE", raising=False)
+    monkeypatch.delenv("PAGEINDEX_VISION_GARBLED_MIN_CHARS", raising=False)
+    # A broken font garbles every page: the median page sits far below
+    # any healthy document's (a 3-of-5 majority already drags it to ~0).
+    assert vision_mod.document_is_garbled(
+        [PROSE_PAGE] * 2 + [CIPHER_PAGE] * 3) is True
+    # A single symbol-dense page (a numeric table, a dotted TOC) inside
+    # a healthy document must NOT arm the gate — its median page is prose.
+    assert vision_mod.document_is_garbled(
+        [CIPHER_PAGE] + [PROSE_PAGE] * 5) is False
+    # Too little judgeable text to tell: not garbled.
+    assert vision_mod.document_is_garbled(["", "   "]) is False
+
+
+def test_env_garbled_thresholds_read_at_call_time(monkeypatch):
+    monkeypatch.setenv("PAGEINDEX_VISION_GARBLED_LETTER_SHARE", "0.9")
+    monkeypatch.setenv("PAGEINDEX_VISION_GARBLED_MIN_CHARS", "10")
+    assert vision_mod.is_garbled_page("numbers 12345 67890") is True
+    monkeypatch.setenv("PAGEINDEX_VISION_GARBLED_LETTER_SHARE", "0.05")
+    assert vision_mod.is_garbled_page("numbers 12345 67890") is False
+    monkeypatch.setenv("PAGEINDEX_VISION_GARBLED_MIN_CHARS", "500")
+    assert vision_mod.is_garbled_page(CIPHER_PAGE) is False  # below floor
+
+
+def test_garbled_prompt_omits_layer_and_transcribes(monkeypatch):
+    captured = {}
+
+    def fake_completion(model, prompt, timeout=None):
+        captured["prompt"] = prompt
+        return "<page-vision>\nTABLE OF CONTENTS\n1 Introduction ... 5\n</page-vision>"
+
+    monkeypatch.setattr(vision_mod, "llm_completion", fake_completion)
+    out = vision_mod.transcribe_page("m", CIPHER_PAGE, "data:img", garbled=True)
+    assert "TABLE OF CONTENTS" in out
+    text_part = captured["prompt"][0]["text"]
+    assert vision_mod.GARBLED_PROMPT.splitlines()[0] in text_part
+    assert CIPHER_PAGE not in text_part            # garbage never sent
+    assert "unusable" in text_part
+
+    # The sparse prompt still carries the text layer.
+    vision_mod.transcribe_page("m", "readable text", "data:img")
+    assert "readable text" in captured["prompt"][0]["text"]
+    assert vision_mod.VISION_PROMPT.splitlines()[0] in captured["prompt"][0]["text"]
+
+
+def test_garbled_transcript_replaces_page_text(monkeypatch, sample_pdf):
+    monkeypatch.setattr(vision_mod, "count_tokens", _zero_tokens)
+    monkeypatch.setattr(vision_mod, "render_page_jpeg",
+                        lambda doc, index: f"data:img{index}")
+    seen = {}
+
+    def fake_transcribe(model, page_text, image_data_url, garbled=False):
+        seen[image_data_url] = garbled
+        if image_data_url == "data:img0":
+            return "TABLE OF CONTENTS transcribed"
+        return "sparse supplement"
+
+    monkeypatch.setattr(vision_mod, "transcribe_page", fake_transcribe)
+    # count_tokens faked to 0: both pages are sparse; the doc-level
+    # garble gate is armed by the median page (all cipher here).
+    page_texts = [CIPHER_PAGE, CIPHER_PAGE]
+    out = vision_mod.transcribe_sparse_pages(sample_pdf, page_texts)
+    assert seen == {"data:img0": True, "data:img1": True}
+    # Replacement, not append: no cipher residue, whole page is the block.
+    assert out[0] == "<page-vision>\nTABLE OF CONTENTS transcribed\n</page-vision>"
+    assert CIPHER_PAGE not in out[1]
+    assert out[1] == "<page-vision>\nsparse supplement\n</page-vision>"
+
+
+def test_garbled_page_without_transcript_keeps_original(monkeypatch,
+                                                        sample_pdf):
+    monkeypatch.setattr(vision_mod, "count_tokens", _zero_tokens)
+    monkeypatch.setattr(vision_mod, "render_page_jpeg",
+                        lambda doc, index: f"data:img{index}")
+
+    def fake_transcribe(model, page_text, image_data_url, garbled=False):
+        return "" if image_data_url == "data:img0" else "got one"
+
+    monkeypatch.setattr(vision_mod, "transcribe_page", fake_transcribe)
+    page_texts = [CIPHER_PAGE, CIPHER_PAGE]
+    out = vision_mod.transcribe_sparse_pages(sample_pdf, page_texts)
+    # A page whose model call came back empty keeps its (garbled) text:
+    # replacement only ever happens on a real transcript.
+    assert out[0] == CIPHER_PAGE
+    assert out[1] == "<page-vision>\ngot one\n</page-vision>"
+
+
+def test_normal_doc_garbled_page_untouched(monkeypatch, sample_pdf):
+    # A cipher page inside a healthy document: the doc-level gate stays
+    # closed, so the page is neither rendered nor transcribed — the
+    # sparse gate alone decides, and this dense cipher page is not sparse.
+    monkeypatch.setattr(vision_mod, "count_tokens",
+                        lambda text, model=None: 1000)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("no VLM call expected for a healthy document")
+
+    monkeypatch.setattr(vision_mod, "transcribe_page", fail)
+    page_texts = [PROSE_PAGE, CIPHER_PAGE, PROSE_PAGE]
+    out = vision_mod.transcribe_sparse_pages(sample_pdf, page_texts)
+    assert out == page_texts
 
 
 # ── subprocess isolation ──
@@ -520,10 +649,13 @@ def test_guard_returns_none_when_pool_breaks(monkeypatch, sample_pdf):
 @pytest.mark.real_guard
 def test_guard_runs_detection_in_real_child(sample_pdf):
     # End-to-end spawn check: the guard's child must import the package,
-    # open the document, and return (sparse, renders) through the pool.
+    # open the document, and return the detection result through the pool.
     dense = " ".join(["word"] * 40)
-    sparse_list, renders = vision_mod._detect_and_render_guarded(
+    targets, renders, garbled, doc_garbled = vision_mod._detect_and_render_guarded(
         sample_pdf, [dense, dense])
-    # conftest's sample_pdf is two text-only pages: nothing sparse.
-    assert sparse_list == []
+    # conftest's sample_pdf is two text-only pages: nothing sparse, and
+    # the all-prose texts are not a garbled document.
+    assert targets == []
     assert renders == {}
+    assert garbled == set()
+    assert doc_garbled is False
