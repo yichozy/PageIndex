@@ -185,8 +185,8 @@ def test_llm_completion_pins_temperature_zero(monkeypatch):
 
     def fake_completion(**kwargs):
         captured.update(kwargs)
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+        return [SimpleNamespace(choices=[SimpleNamespace(
+            delta=SimpleNamespace(content="ok"), finish_reason="stop")])]
 
     monkeypatch.setattr(litellm, "completion", fake_completion)
     assert pageindex.utils.llm_completion("gpt-4o", "probe") == "ok"
@@ -204,8 +204,12 @@ def test_llm_acompletion_pins_temperature_zero(monkeypatch):
 
     async def fake_acompletion(**kwargs):
         captured.update(kwargs)
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+
+        async def stream():
+            yield SimpleNamespace(choices=[SimpleNamespace(
+                delta=SimpleNamespace(content="ok"), finish_reason="stop")])
+
+        return stream()
 
     monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
     assert asyncio.run(pageindex.utils.llm_acompletion("gpt-4o", "probe")) == "ok"

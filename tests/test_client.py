@@ -769,6 +769,84 @@ def test_llm_completion_refuses_unknown_provider(monkeypatch):
         pageindex.utils.llm_completion("Qwen/my-model", "probe")
 
 
+def _chunk(content=None, finish_reason=None):
+    """One streamed chunk shaped like litellm's; content=None makes a
+    keep-alive chunk carrying neither delta text nor finish_reason."""
+    delta = None if content is None else types.SimpleNamespace(content=content)
+    return types.SimpleNamespace(choices=[
+        types.SimpleNamespace(delta=delta, finish_reason=finish_reason)])
+
+
+def test_llm_completion_streams_and_maps_finish_reason(monkeypatch):
+    """Completions go out with stream=True (a non-streamed call that outlives
+    a proxy's read window — Cloudflare 524s at 120s — can never succeed) and
+    the deltas come back assembled, with usage-only chunks skipped."""
+    import litellm
+    captured = {}
+
+    def fake_completion(**kwargs):
+        captured.update(kwargs)
+        return [_chunk(), _chunk("Hello "), _chunk(""), _chunk("world"),
+                types.SimpleNamespace(choices=[]),  # usage-only chunk
+                _chunk(finish_reason="length")]
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    content, finish = pageindex.utils.llm_completion(
+        "gpt-4o", "probe", return_finish_reason=True)
+
+    assert content == "Hello world"
+    assert finish == "max_output_reached"
+    assert captured["stream"] is True
+
+    monkeypatch.setattr(litellm, "completion",
+                        lambda **kw: [_chunk("ok", finish_reason="stop")])
+    assert pageindex.utils.llm_completion(
+        "gpt-4o", "probe", return_finish_reason=True) == ("ok", "finished")
+    assert pageindex.utils.llm_completion("gpt-4o", "probe") == "ok"
+
+
+def test_llm_completion_retries_mid_stream_failure(monkeypatch):
+    """A connection dropped between chunks hits the retry ladder like any
+    other failure; the re-asked call starts a fresh stream."""
+    import litellm
+    calls = []
+
+    def first_stream():
+        yield _chunk("partial ")
+        raise ConnectionError("proxy reset mid-stream")
+
+    def fake_completion(**kwargs):
+        calls.append(1)
+        return first_stream() if len(calls) == 1 else (
+            [_chunk("fresh "), _chunk("answer", finish_reason="stop")])
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    monkeypatch.setattr("pageindex.utils.time.sleep", lambda s: None)
+
+    assert pageindex.utils.llm_completion("gpt-4o", "probe") == "fresh answer"
+    assert len(calls) == 2
+
+
+def test_llm_acompletion_accumulates_stream(monkeypatch):
+    import litellm
+    captured = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+
+        async def stream():
+            yield _chunk("async ")
+            yield types.SimpleNamespace(choices=[])
+            yield _chunk("assembled", finish_reason="stop")
+
+        return stream()
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    assert asyncio.run(pageindex.utils.llm_acompletion(
+        "gpt-4o", "probe")) == "async assembled"
+    assert captured["stream"] is True
+
+
 def test_submit_missing_llm_key_fails_loud(local_client, sample_pdf, monkeypatch):
     import litellm  # first import may load a .env; delenv after it
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -1286,9 +1364,7 @@ def test_llm_completion_backend_reaches_litellm(monkeypatch):
     def fake_completion(**kwargs):
         captured.clear()
         captured.update(kwargs)
-        message = types.SimpleNamespace(content="ok")
-        choice = types.SimpleNamespace(message=message, finish_reason="stop")
-        return types.SimpleNamespace(choices=[choice])
+        return [_chunk("ok", finish_reason="stop")]
     monkeypatch.setattr(litellm, "completion", fake_completion)
     monkeypatch.setenv("OPENAI_API_KEY", "k")
     assert pageindex.utils.llm_completion("gpt-4o", "probe") == "ok"
@@ -1314,9 +1390,7 @@ def test_backend_overrides_reserved_kwargs_without_retry(monkeypatch):
         calls["n"] += 1
         captured.clear()
         captured.update(kwargs)
-        message = types.SimpleNamespace(content="ok")
-        choice = types.SimpleNamespace(message=message, finish_reason="stop")
-        return types.SimpleNamespace(choices=[choice])
+        return [_chunk("ok", finish_reason="stop")]
     monkeypatch.setattr(litellm, "completion", fake_completion)
     monkeypatch.setattr(pageindex.utils.time, "sleep", lambda s: None)
     monkeypatch.setenv("OPENAI_API_KEY", "k")
@@ -1898,7 +1972,6 @@ def test_backend_scopes_the_index_lane(tmp_path, monkeypatch):
     operation, bypassing the env pre-check."""
     pytest.importorskip("litellm")
     import litellm
-    from types import SimpleNamespace
     from pageindex.local_api import LocalAPI
     from pageindex.utils import _llm_backend, llm_completion
 
@@ -1909,8 +1982,7 @@ def test_backend_scopes_the_index_lane(tmp_path, monkeypatch):
                                                    "api_base": "http://b"}
     assert _llm_backend.get() is None
 
-    reply = SimpleNamespace(choices=[SimpleNamespace(
-        message=SimpleNamespace(content="ok"), finish_reason="stop")])
+    reply = [_chunk("ok", finish_reason="stop")]
     captured = {}
     monkeypatch.setattr(litellm, "completion",
                         lambda **kw: (captured.update(kw), reply)[1])
@@ -1931,12 +2003,10 @@ def test_index_lane_makes_no_key_prejudgment(monkeypatch):
     environments reach the wire untouched for every provider shape."""
     pytest.importorskip("litellm")
     import litellm
-    from types import SimpleNamespace
     from pageindex.utils import llm_completion
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    reply = SimpleNamespace(choices=[SimpleNamespace(
-        message=SimpleNamespace(content="ok"), finish_reason="stop")])
+    reply = [_chunk("ok", finish_reason="stop")]
     monkeypatch.setattr(litellm, "completion", lambda **kw: reply)
     monkeypatch.setattr(litellm, "validate_environment",
                         lambda *a, **k: pytest.fail("env pre-check ran"))
@@ -2356,9 +2426,7 @@ def test_retry_notice_logs_instead_of_stdout(monkeypatch, capsys, caplog):
         if not attempts:
             attempts.append(1)
             raise RuntimeError("boom")
-        message = types.SimpleNamespace(content="ok")
-        choice = types.SimpleNamespace(message=message, finish_reason="stop")
-        return types.SimpleNamespace(choices=[choice])
+        return [_chunk("ok", finish_reason="stop")]
 
     monkeypatch.setattr(litellm, "completion", flaky)
     monkeypatch.setattr(utils.time, "sleep", lambda s: None)

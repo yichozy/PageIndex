@@ -158,6 +158,50 @@ def _is_unrecoverable(exc: Exception) -> bool:
     return getattr(exc, "status_code", None) in _UNRECOVERABLE_STATUS
 
 
+def _stream_piece(chunk):
+    """(delta text, finish_reason) from one streamed chunk; ("", None) when
+    the chunk carries neither (usage-only or keep-alive chunks)."""
+    choices = getattr(chunk, "choices", None) or []
+    if not choices:
+        return "", None
+    piece = getattr(getattr(choices[0], "delta", None), "content", None) or ""
+    return piece, choices[0].finish_reason
+
+
+def _finish_label(finish_reason):
+    return "max_output_reached" if finish_reason == "length" else "finished"
+
+
+def _consume_stream(stream, return_finish_reason):
+    parts = []
+    finish_reason = None
+    for chunk in stream:
+        piece, reason = _stream_piece(chunk)
+        if piece:
+            parts.append(piece)
+        if reason:
+            finish_reason = reason
+    content = "".join(parts)
+    if return_finish_reason:
+        return content, _finish_label(finish_reason)
+    return content
+
+
+async def _consume_stream_async(stream, return_finish_reason):
+    parts = []
+    finish_reason = None
+    async for chunk in stream:
+        piece, reason = _stream_piece(chunk)
+        if piece:
+            parts.append(piece)
+        if reason:
+            finish_reason = reason
+    content = "".join(parts)
+    if return_finish_reason:
+        return content, _finish_label(finish_reason)
+    return content
+
+
 def llm_completion(model, prompt, chat_history=None, return_finish_reason=False,
                    timeout=None):
     import litellm
@@ -179,14 +223,15 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False,
                 # default (DeepSeek: 1.0) re-rolls every TOC extraction, making
                 # verify_toc's 60% gate a coin flip on borderline documents
                 "temperature": 0,
+                # stream so bytes flow from the first token: a non-streamed
+                # completion that outlives a proxy's read window (Cloudflare
+                # 524s at its 120s Proxy Read Timeout) fails deterministically
+                # and no retry ladder saves it
+                "stream": True,
                 **({"timeout": timeout} if timeout is not None else {}),
                 **(backend or {}),
             })
-            content = response.choices[0].message.content
-            if return_finish_reason:
-                finish_reason = "max_output_reached" if response.choices[0].finish_reason == "length" else "finished"
-                return content, finish_reason
-            return content
+            return _consume_stream(response, return_finish_reason)
         except Exception as e:
             if getattr(e, "status_code", None) in _NO_RETRY_STATUS:
                 raise
@@ -218,9 +263,12 @@ async def llm_acompletion(model, prompt):
                 "max_retries": 0,
                 # same rationale as llm_completion: deterministic extraction
                 "temperature": 0,
+                # same rationale as llm_completion: survive proxy read
+                # timeouts on long generations
+                "stream": True,
                 **(backend or {}),
             })
-            return response.choices[0].message.content
+            return await _consume_stream_async(response, False)
         except Exception as e:
             if getattr(e, "status_code", None) in _NO_RETRY_STATUS:
                 raise
