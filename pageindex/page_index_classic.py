@@ -858,11 +858,17 @@ def process_none_page_numbers(toc_items, page_list, start_index=1, model=None):
                     continue
 
             item_copy = copy.deepcopy(item)
-            del item_copy['page']
+            item_copy.pop('page', None)
             result = add_page_number_to_toc(page_contents, item_copy, model)
-            if isinstance(result[0]['physical_index'], str) and result[0]['physical_index'].startswith('<physical_index'):
-                item['physical_index'] = int(result[0]['physical_index'].split('_')[-1].rstrip('>').strip())
-                del item['page']
+            # The TOC JSON may omit physical_index entirely or spell the
+            # marker bare (same endpoint family as the chunk validator
+            # tolerates); a missing/unparseable value just leaves this
+            # entry without a page, as a nullified marker always did.
+            val = (_parse_physical_index(result[0].get('physical_index'))
+                   if result else None)
+            if val is not None:
+                item['physical_index'] = val
+                item.pop('page', None)
     
     return toc_items
 

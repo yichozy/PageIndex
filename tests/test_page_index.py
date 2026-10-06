@@ -108,5 +108,47 @@ class PhysicalIndexParsingTest(unittest.TestCase):
         self.assertIsNone(result[4]["physical_index"])
 
 
+class ProcessNonePageNumbersTest(unittest.TestCase):
+    """The TOC lane's page-fill step read result[0]['physical_index']
+    bare: an endpoint whose TOC JSON omits the key crashed with
+    KeyError, an empty response with IndexError, and bare marker
+    spellings were silently skipped. All three now route through the
+    tolerant parser."""
+
+    def test_tolerates_missing_key_empty_result_and_bare_marker(self):
+        from pageindex.page_index_classic import process_none_page_numbers
+
+        cases = [
+            ([{"structure": "1", "title": "A"}], "missing key"),
+            ([], "empty result"),
+        ]
+        for llm_result, label in cases:
+            with patch(
+                "pageindex.page_index_classic.add_page_number_to_toc",
+                return_value=llm_result,
+            ), patch(
+                "pageindex.page_index_classic.count_tokens",
+                return_value=1,
+            ):
+                toc = [{"structure": "1", "title": "A", "page": 3}]
+                # Neither shape raises; the entry just stays page-less.
+                process_none_page_numbers(toc, [["page text"]])
+                self.assertNotIn("physical_index", toc[0], label)
+
+        with patch(
+            "pageindex.page_index_classic.add_page_number_to_toc",
+            return_value=[{"structure": "1", "title": "A",
+                           "physical_index": "physical_index_1"}],
+        ), patch(
+            "pageindex.page_index_classic.count_tokens",
+            return_value=1,
+        ):
+            toc = [{"structure": "1", "title": "A", "page": 3}]
+            process_none_page_numbers(toc, [["page text"]])
+            # Bare spelling parses to the int page and retires 'page'.
+            self.assertEqual(toc[0]["physical_index"], 1)
+            self.assertNotIn("page", toc[0])
+
+
 if __name__ == "__main__":
     unittest.main()
