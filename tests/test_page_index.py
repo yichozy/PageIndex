@@ -65,5 +65,48 @@ class ProcessTocNoPageNumbersTest(unittest.TestCase):
         self.assertIn("<physical_index_1>", wrapped)
 
 
+class PhysicalIndexParsingTest(unittest.TestCase):
+    """Endpoints differ in whether angle brackets survive into the JSON
+    string (a router to one serving stack emitted bare physical_index_N,
+    and the strict marker regex nulled every entry -> "Processing
+    failed"). The parser accepts every spelling; membership in the
+    chunk's real markers stays the guard."""
+
+    def test_parse_physical_index_tolerates_endpoint_spellings(self):
+        from pageindex.page_index_classic import _parse_physical_index
+
+        self.assertEqual(_parse_physical_index("<physical_index_3>"), 3)
+        self.assertEqual(_parse_physical_index("physical_index_3"), 3)
+        self.assertEqual(_parse_physical_index(3), 3)
+        self.assertEqual(_parse_physical_index("3"), 3)
+        self.assertIsNone(_parse_physical_index(None))
+        self.assertIsNone(_parse_physical_index("page 3"))
+
+    def test_validate_chunk_accepts_bare_forms_rejects_absent_markers(self):
+        from pageindex.page_index_classic import (
+            _validate_chunk_physical_indices,
+        )
+
+        content = "head <physical_index_1> body <physical_index_2> tail"
+        toc = [
+            {"title": "A", "physical_index": "<physical_index_1>"},
+            {"title": "B", "physical_index": "physical_index_2"},
+            {"title": "C", "physical_index": 2},
+            {"title": "D", "physical_index": "physical_index_9"},
+            {"title": "E", "physical_index": "nonsense"},
+        ]
+
+        result = _validate_chunk_physical_indices(toc, content)
+
+        # Accepted spellings survive as the model wrote them.
+        self.assertEqual(result[0]["physical_index"], "<physical_index_1>")
+        self.assertEqual(result[1]["physical_index"], "physical_index_2")
+        self.assertEqual(result[2]["physical_index"], 2)
+        # A marker the chunk never contained, or an unparseable value,
+        # is still nulled — the anti-hallucination guard is unchanged.
+        self.assertIsNone(result[3]["physical_index"])
+        self.assertIsNone(result[4]["physical_index"])
+
+
 if __name__ == "__main__":
     unittest.main()

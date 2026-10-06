@@ -57,12 +57,18 @@ def _secure_doc_text(text: str) -> str:
     """Sanitize + delimiter-frame a PDF text block before LLM injection."""
     return _wrap_doc_text(_sanitize_doc_text(text))
 
-_PHYSICAL_INDEX_MARKER_RE = re.compile(r"^<physical_index_(\d+)>$")
+# The page-marker value as the model copies it into JSON: brackets
+# optional. Endpoints differ in whether angle brackets survive the copy
+# (serving stacks behind some routers emit bare "physical_index_5"), and
+# convert_physical_index_to_int has always accepted both spellings —
+# the membership checks, not the spelling, guard against hallucinated
+# pages.
+_PHYSICAL_INDEX_VALUE_RE = re.compile(r"^<?physical_index_(\d+)>?$")
 
 def _parse_physical_index(raw):
     if raw is None:
         return None
-    marker_match = _PHYSICAL_INDEX_MARKER_RE.match(str(raw).strip())
+    marker_match = _PHYSICAL_INDEX_VALUE_RE.match(str(raw).strip())
     if marker_match:
         return int(marker_match.group(1))
     try:
@@ -332,9 +338,9 @@ def _validate_chunk_physical_indices(toc: list, content: str) -> list:
         if raw is None:
             continue
 
-        m = _PHYSICAL_INDEX_MARKER_RE.match(str(raw).strip())
-        if not m or int(m.group(1)) not in valid_indices:
-           entry["physical_index"] = None
+        val = _parse_physical_index(raw)
+        if val is None or val not in valid_indices:
+            entry["physical_index"] = None
 
     return toc
 
@@ -775,11 +781,8 @@ def process_toc_no_page_numbers(toc_content, toc_page_list, page_list,  start_in
             raw = update.get("physical_index")
             if raw is None:
                 continue
-            m = _PHYSICAL_INDEX_MARKER_RE.match(str(raw).strip())
-            
-            if not m:
-                continue
-            if int(m.group(1)) not in valid_indices:
+            val = _parse_physical_index(raw)
+            if val is None or val not in valid_indices:
                 continue
                 
             current["physical_index"] = raw
