@@ -483,6 +483,19 @@ class LocalAPI:
                 ("id", "name", "description", "status", "createdAt", "pageNum",
                  "folderId", "metadata")}
 
+    def get_source_path(self, doc_id: str) -> str | None:
+        """The stored original PDF behind a document, or None when absent.
+
+        The service deployment persists every upload at
+        ``<storage root>/<doc_id>/document.pdf`` — the same root this
+        store's ``docs/<doc_id>/`` directory lives under — so the path is
+        derived from the layout, never recorded in meta. Pure-local
+        libraries without the service layout return None; the tool layer
+        turns that into an INVALID_INPUT envelope, not an exception.
+        """
+        path = self._store._root / str(doc_id) / "document.pdf"
+        return str(path) if path.is_file() else None
+
     def delete_document(self, doc_id: str) -> dict[str, Any]:
         if not self._store.delete_document(doc_id):
             raise PageIndexAPIError("Failed to delete document: Document not found.")

@@ -4,10 +4,13 @@ Tool names and the surviving input-schema structure match the PageIndex
 cloud MCP server — the local surface hides the documented cloud-only
 parameters — so agent prompts port across the cloud MCP connection and
 this in-process layer. Only the tools that exist in every mode are
-registered (no folders, search_documents, or get_document_image), and the
-guidance strings (tool descriptions) adapt to the local surface the same
-way the agent instructions do — they never teach capabilities that only
-exist on the cloud.
+registered for the default surfaces (no folders, search_documents, or
+get_document_image); the chat lanes may instead run the page_images tool
+set, whose get_document_image is a local implementation (schema in
+_PAGE_IMAGE_TOOL, deliberately outside TOOL_CONTRACT) and never joins the
+default contract set. The guidance strings (tool descriptions) adapt to
+the local surface the same way the agent instructions do — they never
+teach capabilities that only exist on the cloud.
 
 Tools never raise: every outcome, including errors, is returned as the
 same JSON envelope the cloud emits ({"success": true, ...} /
@@ -38,6 +41,9 @@ from .mcp_bridge import render_prompt_text, render_text
 
 TOOL_RESPONSE_CHAR_LIMIT = 100_000
 STRUCTURE_FIRST_PAGE_THRESHOLD = 20
+
+#: Render resolution (DPI) of the chat page-image tool.
+PAGE_IMAGE_DPI_DEFAULT = 150.0
 
 _CHAR_BUDGET = int(TOOL_RESPONSE_CHAR_LIMIT * 0.95)
 _MAX_REQUESTED_PAGES = 10_000
@@ -304,6 +310,9 @@ TOOL_CONTRACT: dict[str, dict[str, Any]] = {
 
 _READ_TOOLS = ("browse_documents", "get_document", "get_document_structure",
                "get_page_content")
+#: The chat page-images lane swaps get_page_content for get_document_image.
+_READ_TOOLS_PAGE_IMAGES = ("browse_documents", "get_document",
+                           "get_document_structure", "get_document_image")
 _MANAGEMENT_TOOLS = ("remove_document",)
 
 
@@ -1125,6 +1134,200 @@ def _get_page_content(client, doc_name: str, pages: str,
     )
 
 
+# ── chat page-image tool (the page_images lane's reading surface) ──
+
+def _page_image_context(
+        client, doc_name: str, page: Any,
+        _allowed_ids: Optional[frozenset] = None,
+) -> "tuple[Optional[dict[str, Any]], Optional[_ToolResult]]":
+    """Validate one page-image request: scope, status, page bounds, and
+    the stored original PDF. Returns (context, None) — context carries
+    entry / page / total_pages / source_path — or (None, error pair).
+    Shared by both faces of the tool: the dict envelope never renders,
+    the blocks face never re-validates."""
+    entry, error = _resolve_document(client, doc_name,
+                                     allowed_ids=_allowed_ids)
+    if error is not None:
+        return None, error
+    assert entry is not None
+    if entry.get("status") != "completed":
+        return None, _not_ready_error(doc_name, entry.get("status"),
+                                      "page image retrieval", False)
+    if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+        return None, _failure(
+            f"page must be a positive 1-based integer (the first page is "
+            f"page 1), got {page!r}",
+            {"doc_name": doc_name},
+            {
+                "summary": "Invalid page number",
+                "options": [
+                    "Pass page as an integer, e.g. page: 1",
+                    "Use get_document() to check the document's page count",
+                ],
+            },
+            "INVALID_INPUT",
+        )
+    try:
+        details = client.get_document(entry["id"])
+    except PageIndexAPIError as exc:
+        return None, _failure(
+            f"Failed to verify the page count: {exc}",
+            {"doc_name": doc_name},
+            {
+                "summary": "Unable to retrieve document details.",
+                "options": ["Try the request again"],
+                "auto_retry": "This may be a temporary issue - you can try "
+                              "the request again",
+            },
+            "INTERNAL_ERROR",
+        )
+    total = details.get("pageNum")
+    if not isinstance(total, int) or total < 1:
+        return None, _failure(
+            "The document's page count is unavailable, so no page can be "
+            "validated for rendering.",
+            {"doc_name": doc_name},
+            {
+                "summary": "Page count missing from document metadata",
+                "options": ["Use get_document() to inspect the document",
+                            "Re-index the document if the problem persists"],
+            },
+            "INTERNAL_ERROR",
+        )
+    if page > total:
+        return None, _failure(
+            f"Page {page} is out of range. Document has {total} pages.",
+            {"doc_name": doc_name, "total_pages": total,
+             "requested_page": page},
+            {
+                "summary": "Requested page is out of range",
+                "options": [
+                    f"Request a page between 1 and {total}",
+                    "Use get_document() to check the document's page count",
+                ],
+            },
+            "INVALID_INPUT",
+        )
+    source = getattr(client, "get_source_path", None)
+    path = source(entry["id"]) if source is not None else None
+    if not path:
+        return None, _failure(
+            "The original PDF for this document is not stored, so its "
+            "pages cannot be rendered as images.",
+            {"doc_name": doc_name},
+            {
+                "summary": "Original PDF not available in this library",
+                "options": [
+                    "Re-upload the document through the PageIndex service "
+                    "deployment, which persists the original PDF",
+                    "Use browse_documents() to work with other documents",
+                ],
+            },
+            "INVALID_INPUT",
+        )
+    return {"entry": entry, "page": page, "total_pages": total,
+            "source_path": path}, None
+
+
+def _get_document_image(client, doc_name: str, page: Any,
+                        _allowed_ids: Optional[frozenset] = None,
+                        ) -> tuple[dict, bool]:
+    """The call_tool text face: the same validation and metadata envelope
+    as the chat lane's image blocks, minus the image — binary content
+    never rides a JSON envelope."""
+    context, error = _page_image_context(client, doc_name, page,
+                                         _allowed_ids)
+    if error is not None:
+        return error
+    assert context is not None
+    return _success(
+        {
+            "doc_name": doc_name,
+            "page": context["page"],
+            "total_pages": context["total_pages"],
+            "dpi": PAGE_IMAGE_DPI_DEFAULT,
+            "note": ("The rendered page image is delivered as an image "
+                     "block on the chat surfaces that carry it; this text "
+                     "envelope carries the metadata only."),
+        },
+        {
+            "summary": (f"Page {context['page']} of "
+                        f"{context['total_pages']} validated for "
+                        "rendering."),
+            "options": [
+                f"View other pages with page: 1-{context['total_pages']}",
+            ],
+        },
+    )
+
+
+def _get_document_image_blocks(client, arguments: dict,
+                               doc_ids=None) -> tuple[list, bool]:
+    """The chat lanes' face: MCP content blocks — the page as a PNG image
+    block first, its citation metadata (doc_name/page/dpi) as a text
+    block after. Every block is a structured MCP content dict: the
+    Agents SDK drops the image if the block list mixes in a bare
+    string. Validation failures collapse to one text block carrying the
+    same error envelope as the text face."""
+    kwargs = arguments or {}
+    allowed = None
+    if doc_ids is not None:
+        ids = [doc_ids] if isinstance(doc_ids, str) else doc_ids
+        allowed = frozenset(str(one_id) for one_id in ids)
+    context, error = _page_image_context(
+        client, kwargs.get("doc_name"), kwargs.get("page"),
+        _allowed_ids=allowed)
+    if error is not None:
+        payload, is_error = error
+        return [{"type": "text", "text": _dumps(payload)}], is_error
+    assert context is not None
+    dpi = PAGE_IMAGE_DPI_DEFAULT
+    try:
+        import pypdfium2 as pdfium
+        from .vision import render_page_png
+        pdf = pdfium.PdfDocument(context["source_path"])
+        try:
+            data = render_page_png(pdf, context["page"] - 1, dpi)
+        finally:
+            pdf.close()
+    except Exception as exc:
+        payload, is_error = _failure(
+            f"Failed to render page {context['page']}: {exc}",
+            {"doc_name": context["entry"].get("name"),
+             "page": context["page"]},
+            {
+                "summary": "Page rendering failed",
+                "options": ["Try the request again",
+                            "Try a different page"],
+                "auto_retry": "This may be a temporary issue - you can try "
+                              "the request again",
+            },
+            "INTERNAL_ERROR",
+        )
+        return [{"type": "text", "text": _dumps(payload)}], is_error
+    payload, _ = _success(
+        {
+            "doc_name": context["entry"].get("name"),
+            "page": context["page"],
+            "total_pages": context["total_pages"],
+            "dpi": dpi,
+            "note": ("Image block rendered from the stored original PDF; "
+                     "cite this page number for anything read from it."),
+        },
+        {
+            "summary": (f"Page {context['page']} of "
+                        f"{context['total_pages']} rendered."),
+            "options": [
+                f"View other pages with page: 1-{context['total_pages']}",
+            ],
+        },
+    )
+    return [
+        {"type": "image", "data": data, "mimeType": "image/png"},
+        {"type": "text", "text": _dumps(payload)},
+    ], False
+
+
 def _remove_document(client, doc_names: list[str],
                      folder_id: Optional[str] = None,
                      _allowed_ids: Optional[frozenset] = None) -> tuple[dict, bool]:
@@ -1182,12 +1385,19 @@ _IMPLEMENTATIONS: dict[str, Callable[..., tuple[dict, bool]]] = {
     "get_document": _get_document,
     "get_document_structure": _get_document_structure,
     "get_page_content": _get_page_content,
+    "get_document_image": _get_document_image,
     "remove_document": _remove_document,
 }
 
 
-def tool_names(include_management: bool = False) -> tuple[str, ...]:
-    return _READ_TOOLS + (_MANAGEMENT_TOOLS if include_management else ())
+def tool_names(include_management: bool = False, page_images: bool = False,
+               ) -> tuple[str, ...]:
+    """The default read set, or the page_images variant the chat lanes
+    run (get_document_image in place of get_page_content). Either way
+    call_tool answers every name in _IMPLEMENTATIONS — the image tool's
+    text face is the metadata envelope."""
+    read = _READ_TOOLS_PAGE_IMAGES if page_images else _READ_TOOLS
+    return read + (_MANAGEMENT_TOOLS if include_management else ())
 
 
 def _coerce_bool_args(schema: dict, kwargs: dict[str, Any]) -> None:
@@ -1312,13 +1522,55 @@ _LOCAL_PARAM_DESCRIPTIONS: dict[tuple[str, str], str] = {
     ),
 }
 
+#: The chat page-images lane's local image tool. Deliberately NOT in
+#: TOOL_CONTRACT: the contract is byte-identical to the frozen cloud MCP
+#: tool set (guard-tested), and the cloud's own get_document_image keeps
+#: its live cloud schema on the bridge path.
+_PAGE_IMAGE_TOOL: dict[str, Any] = {
+    "description": (
+        "View one page of a document as a rendered image. This is the "
+        "reading tool: figures, charts, diagrams, tables, and any "
+        "graphical content are read from the image, and the metadata "
+        "beside each image carries the page number for citations. Locate "
+        "candidate pages with get_document_structure() (or get_document() "
+        "for the page count), then view them one at a time — one page "
+        "per call."
+    ),
+    "schema": {
+        "type": "object",
+        "properties": {
+            "doc_name": {
+                "type": "string",
+                "description": _LOCAL_DOC_NAME_DESCRIPTION,
+            },
+            "page": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Page number to view, 1-based (page 1 is the first "
+                    "page). One page per call; use get_document_structure() "
+                    "to locate the right pages first."
+                ),
+            },
+        },
+        "required": ["doc_name", "page"],
+    },
+}
+
 
 def _local_description(name: str) -> str:
-    return _LOCAL_DESCRIPTIONS.get(name) or TOOL_CONTRACT[name]["description"]
+    if name in _LOCAL_DESCRIPTIONS:
+        return _LOCAL_DESCRIPTIONS[name]
+    if name == "get_document_image":
+        return _PAGE_IMAGE_TOOL["description"]
+    return TOOL_CONTRACT[name]["description"]
 
 
 def _local_schema(name: str) -> dict[str, Any]:
-    schema = copy.deepcopy(TOOL_CONTRACT[name]["schema"])
+    if name == "get_document_image":
+        schema = copy.deepcopy(_PAGE_IMAGE_TOOL["schema"])
+    else:
+        schema = copy.deepcopy(TOOL_CONTRACT[name]["schema"])
     for param in _LOCAL_HIDDEN_PARAMS.get(name, ()):
         schema["properties"].pop(param, None)
     for (tool_name, param), text in _LOCAL_PARAM_DESCRIPTIONS.items():
@@ -1520,13 +1772,16 @@ def _require_doc_selection(doc_ids) -> None:
 
 
 def _tool_specs(client, include_management: bool = False, doc_ids=None,
+                page_images: bool = False,
                 ) -> "list[tuple[str, str, dict, Callable[[dict], tuple[list, bool]]]]":
     """(name, description, schema, invoke) per tool, for adapters that take
     the wire schema verbatim. ``invoke`` returns (content blocks, is_error):
     the MCP content as the server sent it, one text block from the local
     tools. Schemas are copies (frameworks keep the dict by reference).
     ``doc_ids`` is the local chat scope, already validated and dropped on
-    cloud by ``_local_doc_scope``."""
+    cloud by ``_local_doc_scope``. ``page_images`` swaps the local read set
+    for the image-reading variant; the cloud branch ignores it (the live
+    tool set already ships get_document_image)."""
     if getattr(client, "api_key", None):
         bridge = _cloud_bridge(client, gated=not include_management)
         tools_meta = bridge.list_tools()
@@ -1548,12 +1803,20 @@ def _tool_specs(client, include_management: bool = False, doc_ids=None,
         def invoke(arguments: dict) -> tuple[list, bool]:
             text, is_error = call_tool(client, name, arguments,
                                        doc_ids=doc_ids)
+            if page_images:
+                # The lane's tool set has no get_page_content; every text
+                # surface it emits must name the tools it actually ships.
+                text = _page_image_prompt(text)
             return [{"type": "text", "text": text}], is_error
         return invoke
 
+    def page_image_invoke(arguments: dict) -> tuple[list, bool]:
+        return _get_document_image_blocks(client, arguments, doc_ids=doc_ids)
+
     return [(name, _local_description(name), _local_schema(name),
-             local_invoke(name))
-            for name in tool_names(include_management)]
+             page_image_invoke if name == "get_document_image"
+             else local_invoke(name))
+            for name in tool_names(include_management, page_images)]
 
 
 def build_agent_tools(client, include_management: bool = False,
@@ -1589,6 +1852,12 @@ READING WORKFLOW:
 - For documents over {STRUCTURE_FIRST_PAGE_THRESHOLD} pages: call get_document_structure() first to locate relevant sections, then get_page_content() with targeted page ranges.
 - For small documents ({STRUCTURE_FIRST_PAGE_THRESHOLD} pages or fewer): call get_page_content() directly."""
 
+_READING_WORKFLOW_PAGE_IMAGES = f"""\
+READING WORKFLOW:
+- For documents over {STRUCTURE_FIRST_PAGE_THRESHOLD} pages: call get_document_structure() first to locate relevant pages, then get_document_image() to view those pages one at a time.
+- For small documents ({STRUCTURE_FIRST_PAGE_THRESHOLD} pages or fewer): call get_document_image() directly, page by page.
+- Read everything from the returned page image — figures, charts, tables, and text alike — and cite the page number the tool's metadata reports."""
+
 _TOOL_USAGE_RULES = """\
 TOOL USAGE RULES:
 - Invoke a tool only when all required parameters are present or clearly inferable. Never invent placeholder values.
@@ -1616,15 +1885,21 @@ This protocol applies both when results are empty AND when results are returned 
 3. Page through the ENTIRE library with `limit: 50` and `offset: next_offset` until has_more is false — MANDATORY, must be completed before concluding "not found"
 Only after ALL steps have been tried may you conclude the document is not in the library. Do NOT fall back to general knowledge — if the user's question references their own documents, exhaust every discovery path first."""
 
-AGENT_INSTRUCTIONS = "\n\n".join([
-    _INSTRUCTIONS_HEADER,
-    _READING_WORKFLOW,
-    _TOOL_USAGE_RULES,
-    _DISCOVERY,
-    _DECISION,
-    _AFTER_DISCOVERY,
-    _PERSISTENCE,
-])
+def _assemble_agent_instructions(workflow: str) -> str:
+    return "\n\n".join([
+        _INSTRUCTIONS_HEADER,
+        workflow,
+        _TOOL_USAGE_RULES,
+        _DISCOVERY,
+        _DECISION,
+        _AFTER_DISCOVERY,
+        _PERSISTENCE,
+    ])
+
+
+AGENT_INSTRUCTIONS = _assemble_agent_instructions(_READING_WORKFLOW)
+AGENT_INSTRUCTIONS_PAGE_IMAGES = _assemble_agent_instructions(
+    _READING_WORKFLOW_PAGE_IMAGES)
 
 
 # Frozen from the cloud MCP server's ``cited_answer`` prompt, minus the
@@ -1686,11 +1961,26 @@ def fetch_citation_prompt(client, format: str) -> str:
     return text
 
 
-def _base_instructions(client, include_management: bool = False) -> str:
+def _page_image_prompt(text: str) -> str:
+    """Swap the frozen texts' reading-tool wording for the chat lanes that
+    run the page_images tool set: the citation prompts, the doc targeting
+    block, and the text tools' next_steps name get_page_content(), which
+    that set replaces with get_document_image(). The frozen copies stay
+    byte-identical (the guard tests pin them); only the lane's assembled
+    copy is rewritten."""
+    return text.replace("get_page_content()", "get_document_image()")
+
+
+def _base_instructions(client, include_management: bool = False,
+                       page_images: bool = False) -> str:
     """Cloud: the live instructions the MCP server serves for the tool set
-    actually shipped. Local: the built-in subset instructions."""
+    actually shipped. Local: the built-in subset instructions — the
+    page_images variant swaps the reading workflow for the chat lanes
+    that read pages as images; cloud ignores the flag (its live tool set
+    already ships get_document_image)."""
     if not getattr(client, "api_key", None):
-        base = AGENT_INSTRUCTIONS
+        base = (AGENT_INSTRUCTIONS_PAGE_IMAGES if page_images
+                else AGENT_INSTRUCTIONS)
     else:
         base = _cloud_bridge(
             client, gated=not include_management).instructions()

@@ -13,7 +13,8 @@ import time
 import uuid
 from typing import Any, Iterator, Mapping, Optional, Union
 
-from .agent_tools import _base_instructions, targeting_block
+from .agent_tools import (_base_instructions, _page_image_prompt,
+                          targeting_block)
 from .chat_stream import ChatStream
 from .errors import PageIndexAPIError, _pageindex_cause
 
@@ -25,10 +26,29 @@ CHAT_HEADER = (
 
 # ── shared: prompt, doc targeting, validation, sync bridges ──
 
-def _managed_instructions(client, extra_system: list[str]) -> str:
-    # Local: the built-in subset guidance. Own-model chat over cloud
-    # documents: the live instructions the MCP server serves.
-    base: str = _base_instructions(client)
+def _chat_page_images(client) -> bool:
+    """The chat lanes read pages as images on local libraries (the
+    page_images tool set). Cloud lanes keep the live bridge tool set,
+    which already ships its own get_document_image."""
+    return not getattr(client, "api_key", None)
+
+
+def _chat_targeting_block(client, doc_id, folder_id) -> Optional[str]:
+    """The lanes' doc targeting, its reading-tool wording swapped for the
+    tool set the lane actually ships (the frozen block names
+    get_page_content())."""
+    block = targeting_block(client, doc_id, folder_id)
+    if block and _chat_page_images(client):
+        block = _page_image_prompt(block)
+    return block
+
+
+def _managed_instructions(client, extra_system: list[str],
+                          page_images: bool = False) -> str:
+    # Local: the built-in subset guidance (the page_images variant on the
+    # chat lanes). Own-model chat over cloud documents: the live
+    # instructions the MCP server serves.
+    base: str = _base_instructions(client, page_images=page_images)
     return "\n\n".join([CHAT_HEADER, base,
                         *[t for t in extra_system if t.strip()]])
 
@@ -368,7 +388,8 @@ def _refuse_skeleton(extra_body) -> None:
 def _openai_agent(client, protocol: str, model_name: str, instructions: str,
                   temperature, top_p, doc_ids=None, cache_key=None,
                   reasoning=None, reasoning_effort=None, extra_body=None,
-                  max_tokens=None, backend=None, extra_headers=None):
+                  max_tokens=None, backend=None, extra_headers=None,
+                  page_images: bool = False):
     _refuse_skeleton(extra_body)
     from agents import Agent, ModelSettings
     from .integrations.openai_agents import build_openai_tools
@@ -428,7 +449,8 @@ def _openai_agent(client, protocol: str, model_name: str, instructions: str,
     return Agent(
         name="PageIndex",
         instructions=instructions,
-        tools=build_openai_tools(client, doc_ids=doc_ids),
+        tools=build_openai_tools(client, doc_ids=doc_ids,
+                                 page_images=page_images),
         model=_openai_model(protocol, model_name, conn or None),
         model_settings=settings,
     )
@@ -676,10 +698,11 @@ def _chat_agent(client, messages, doc_id, model, temperature=None,
     and the configured agent. Returns (agent, input items, model name)."""
     system_texts, history = _split_chat_messages(messages)
     scope = client._local_doc_scope(doc_id)
-    block = targeting_block(client, doc_id, folder_id)
+    page_images = _chat_page_images(client)
+    block = _chat_targeting_block(client, doc_id, folder_id)
     items = ([{"role": "user", "content": block}] if block else []) + history
     model_name = model or client.chat_model
-    managed = _managed_instructions(client, system_texts)
+    managed = _managed_instructions(client, system_texts, page_images)
     agent = _openai_agent(client, "chat", model_name, managed,
                           temperature, top_p, doc_ids=scope,
                           cache_key=_conversation_cache_key(
@@ -688,7 +711,8 @@ def _chat_agent(client, messages, doc_id, model, temperature=None,
                           reasoning_effort=reasoning_effort,
                           extra_body=extra_body, max_tokens=max_tokens,
                           backend=_merged_backend(client, backend),
-                          extra_headers=extra_headers)
+                          extra_headers=extra_headers,
+                          page_images=page_images)
     return agent, items, model_name
 
 
@@ -1097,13 +1121,14 @@ def run_responses(client, input, model: Optional[str] = None,
         raise PageIndexAPIError("messages must be a non-empty string or list "
                                 "of item dicts.")
     scope = client._local_doc_scope(doc_id)
-    block = targeting_block(client, doc_id, folder_id)
+    page_images = _chat_page_images(client)
+    block = _chat_targeting_block(client, doc_id, folder_id)
     conversation = items
     if block:
         items = [{"role": "user", "content": block}] + items
     extra = [instructions] if instructions else []
     model_name = model or client.chat_model
-    managed = _managed_instructions(client, extra)
+    managed = _managed_instructions(client, extra, page_images)
     agent = _openai_agent(client, "responses", model_name, managed,
                           temperature, top_p, doc_ids=scope,
                           cache_key=_conversation_cache_key(
@@ -1112,7 +1137,8 @@ def run_responses(client, input, model: Optional[str] = None,
                           reasoning=reasoning, extra_body=extra_body,
                           max_tokens=max_output_tokens,
                           backend=_merged_backend(client, backend),
-                          extra_headers=extra_headers)
+                          extra_headers=extra_headers,
+                          page_images=page_images)
     run_kwargs = _run_kwargs(max_turns)
     recorded: dict = {}
     import openai
@@ -1299,12 +1325,14 @@ def _anthropic_client(backend=None):
     return client
 
 
-def _anthropic_system(client, extra_system) -> list[dict]:
+def _anthropic_system(client, extra_system,
+                      page_images: bool = False) -> list[dict]:
     """System blocks: cache_control marks the stable managed prefix only
     (the API allows 4 breakpoints total — caller blocks must not consume
     the budget); caller system content follows as its own blocks."""
     blocks = [{"type": "text",
-               "text": CHAT_HEADER + "\n\n" + _base_instructions(client),
+               "text": CHAT_HEADER + "\n\n" + _base_instructions(
+                   client, page_images=page_images),
                "cache_control": {"type": "ephemeral"}}]
     if extra_system is None:
         return blocks
@@ -1414,7 +1442,8 @@ def run_messages(client, messages, model: str,
         raise PageIndexAPIError("messages must be a non-empty string or a "
                                 "list of message dicts.")
     scope = client._local_doc_scope(doc_id)
-    block = targeting_block(client, doc_id, folder_id)
+    page_images = _chat_page_images(client)
+    block = _chat_targeting_block(client, doc_id, folder_id)
     prepared = [dict(message) for message in messages]
     if block:
         prepared = [{"role": "user", "content": block}] + prepared
@@ -1423,7 +1452,7 @@ def run_messages(client, messages, model: str,
         "stop_sequences": stop_sequences, "thinking": thinking,
         "extra_body": extra_body, "extra_headers": extra_headers,
     }.items() if value is not None}
-    system_blocks = _anthropic_system(client, system)
+    system_blocks = _anthropic_system(client, system, page_images)
     # Top-level cache_control: the server re-marks the newest block each
     # turn, so the loop re-reads the growing conversation from cache.
     # Counts toward the 4-breakpoint limit (live-verified 400 past it).
@@ -1433,7 +1462,8 @@ def run_messages(client, messages, model: str,
     # Tools before the transport: on a bridge client building them is
     # network I/O, and a failure there must not strand the client below.
     failures: list = []
-    tools = build_anthropic_tools(client, doc_ids=scope, failures=failures)
+    tools = build_anthropic_tools(client, doc_ids=scope, failures=failures,
+                                  page_images=page_images)
     merged = _merged_backend(client, backend)
     backend_client = _anthropic_client(merged)
     # Close only a per-call construction: cached clients stay open for

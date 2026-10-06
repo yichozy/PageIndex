@@ -212,6 +212,16 @@ def render_page_jpeg(doc: Any, index: int) -> str:
         buffer.getvalue()).decode("ascii")
 
 
+def render_page_png(doc: Any, index: int, dpi: float) -> str:
+    """Render one page to bare base64 PNG (no data: prefix — MCP image
+    blocks carry the raw payload) at the given print resolution
+    (scale = dpi / 72, pdfium's 1.0 being 72 DPI)."""
+    image = doc[index].render(scale=dpi / 72).to_pil().convert("RGB")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
 def transcribe_page(model: str | None, page_text: str, image_data_url: str,
                     garbled: bool = False) -> str:
     """One VLM call: page image + text layer → the missing structure text.

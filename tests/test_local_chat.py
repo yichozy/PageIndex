@@ -500,6 +500,38 @@ def test_chat_reasoning_effort_reaches_the_engine(client, store_path,
     assert seen["settings"].extra_args is None
 
 
+@needs_agents
+def test_chat_lane_runs_the_page_image_toolset(client, store_path,
+                                               fake_model, monkeypatch):
+    """The local chat lane reads pages as images: the page_images tool
+    set, the swapped reading workflow, and targeting wording that names
+    only tools the lane ships."""
+    doc_id = seed_doc(store_path, "pi-a", "report.pdf")
+    fake = fake_model([[_msg_item("ok")]])
+    seen = {}
+    real = local_chat._openai_agent
+
+    def spy(*args, **kwargs):
+        agent = real(*args, **kwargs)
+        seen["page_images"] = kwargs.get("page_images")
+        seen["tools"] = [tool.name for tool in agent.tools]
+        seen["instructions"] = args[3]
+        return agent
+
+    monkeypatch.setattr(local_chat, "_openai_agent", spy)
+    client.chat_completions([{"role": "user", "content": "hi"}],
+                            doc_id=doc_id)
+    assert seen["page_images"] is True
+    assert "get_document_image" in seen["tools"]
+    assert "get_page_content" not in seen["tools"]
+    assert "get_document_image()" in seen["instructions"]
+    assert "get_page_content()" not in seen["instructions"]
+    # The doc-targeting block names the lane's tools too.
+    block = fake.inputs[0][0]["content"]
+    assert "get_document_image" in block
+    assert "get_page_content" not in block
+
+
 def test_chat_cloud_unwraps_envelope(monkeypatch):
     cloud = PageIndexCloudClient(api_key="pi-test-key")
 
@@ -1473,8 +1505,9 @@ def test_responses_envelope_fields_and_cache_group(client, store_path,
     fake_model([[_msg_item("ok")]])
     result = client._responses("q")
     names = {tool["name"] for tool in result["tools"]}
+    # The chat lanes ship the page_images read set.
     assert names == {"browse_documents", "get_document",
-                     "get_document_structure", "get_page_content"}
+                     "get_document_structure", "get_document_image"}
     assert all(tool["type"] == "function" for tool in result["tools"])
     assert result["instructions"].startswith(CHAT_HEADER)
     # No transport echo attached here, so these are the fallbacks.
@@ -1747,8 +1780,8 @@ def test_doc_id_scopes_tools_to_targeted_documents(client, store_path,
     seed_doc(store_path, "pi-a", "report.pdf")
     seed_doc(store_path, "pi-b", "payroll.pdf")
     fake = fake_model([
-        [_call_item("get_page_content",
-                    {"doc_name": "payroll.pdf", "pages": "1"})],
+        [_call_item("get_document_structure",
+                    {"doc_name": "payroll.pdf"})],
         [_call_item("browse_documents", {}, "call_2")],
         [_msg_item("done")],
     ])
@@ -3552,9 +3585,9 @@ def test_chat_instructions_precede_history_system_rows(client, store_path,
     seen = {}
     real = local_chat._managed_instructions
 
-    def spy(c, extra):
+    def spy(c, extra, page_images=False):
         seen["extra"] = list(extra)
-        return real(c, extra)
+        return real(c, extra, page_images)
 
     monkeypatch.setattr(local_chat, "_managed_instructions", spy)
     answer = client.chat([{"role": "system", "content": "short"},
@@ -3646,9 +3679,11 @@ def test_chat_citations_managed(monkeypatch):
 
 def test_chat_citations_local_documents_use_the_frozen_copy(client, monkeypatch):
     """Local documents: the frozen copy joins the system prompt the same
-    way (pages are all local content has); a format name raises rather
+    way (pages are all local content has) — the local chat lane's copy
+    carries the page_images wording swap; a format name raises rather
     than silently meaning cite."""
-    from pageindex.agent_tools import LOCAL_CITATION_PROMPTS
+    from pageindex.agent_tools import (LOCAL_CITATION_PROMPTS,
+                                       _page_image_prompt)
     seen = []
     monkeypatch.setattr(
         local_chat, "run_chat_completions",
@@ -3656,7 +3691,8 @@ def test_chat_citations_local_documents_use_the_frozen_copy(client, monkeypatch)
             "choices": [{"message": {"content": "ok"}}]})
     assert client.chat("q", citations=True, instructions="analyst") == "ok"
     assert seen[-1][0] == {"role": "system", "content":
-                           LOCAL_CITATION_PROMPTS["cite"] + "\n\nanalyst"}
+                           _page_image_prompt(LOCAL_CITATION_PROMPTS["cite"])
+                           + "\n\nanalyst"}
     client.chat("q")
     assert seen[-1][0]["role"] == "user"
     with pytest.raises(PageIndexAPIError, match="True or False"):

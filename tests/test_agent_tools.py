@@ -455,6 +455,156 @@ def test_page_content_reports_truncation_and_out_of_range_together(
     assert "size limits" in summary and "out of range" in summary
 
 
+# ── get_document_image (the chat page-images lane) ──
+
+_FLASH_PDF = Path(__file__).parent / "data" / "flash" / "ar_report.pdf"
+
+
+def _seed_doc_with_pdf(store_path, doc_id="pi-a", name="report.pdf"):
+    """A seeded doc plus the service layer's layout: the original PDF at
+    <storage root>/<doc_id>/document.pdf."""
+    seed_doc(store_path, doc_id, name)
+    source_dir = Path(store_path) / doc_id
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "document.pdf").write_bytes(_FLASH_PDF.read_bytes())
+    return doc_id
+
+
+def test_get_document_image_success_blocks(client, store_path):
+    from pageindex.agent_tools import _get_document_image_blocks
+    _seed_doc_with_pdf(store_path)
+    blocks, is_error = _get_document_image_blocks(
+        client, {"doc_name": "report.pdf", "page": 1})
+    assert not is_error
+    assert [block["type"] for block in blocks] == ["image", "text"]
+    image, meta = blocks
+    assert image["mimeType"] == "image/png"
+    assert "data:" not in image["data"]  # MCP image blocks take bare base64
+    import base64
+    assert base64.b64decode(image["data"])[:8] == b"\x89PNG\r\n\x1a\n"
+    payload = json.loads(meta["text"])
+    assert payload["success"] is True
+    assert payload["doc_name"] == "report.pdf"
+    assert payload["page"] == 1 and payload["total_pages"] == 2
+    assert payload["dpi"] == 150.0
+
+
+def test_get_document_image_invalid_input(client, store_path):
+    from pageindex.agent_tools import _get_document_image_blocks
+
+    def run_blocks(doc_ids=None, **arguments):
+        blocks, is_error = _get_document_image_blocks(
+            client, arguments, doc_ids=doc_ids)
+        assert is_error
+        assert [block["type"] for block in blocks] == ["text"]
+        return json.loads(blocks[0]["text"])
+
+    _seed_doc_with_pdf(store_path)  # report.pdf, meta pageNum=2
+    seed_doc(store_path, "pi-b", "payroll.pdf")  # no stored original
+
+    # Outside the chat scope: the same NOT_FOUND as every other tool.
+    payload = run_blocks(doc_ids="pi-a", doc_name="payroll.pdf", page=1)
+    assert payload["errorCode"] == "NOT_FOUND"
+    # Page out of range: the envelope carries the usable page count.
+    payload = run_blocks(doc_name="report.pdf", page=3)
+    assert payload["errorCode"] == "INVALID_INPUT"
+    assert payload["total_pages"] == 2
+    assert any("between 1 and 2" in option
+               for option in payload["next_steps"]["options"])
+    # Non-integer page.
+    payload = run_blocks(doc_name="report.pdf", page="1")
+    assert payload["errorCode"] == "INVALID_INPUT"
+    assert "positive" in payload["error"]
+    # No stored original: explicit INVALID_INPUT, not a bare exception.
+    payload = run_blocks(doc_name="payroll.pdf", page=1)
+    assert payload["errorCode"] == "INVALID_INPUT"
+    assert "original PDF" in payload["error"]
+
+
+def test_get_source_path_layout(client, store_path):
+    doc_id = _seed_doc_with_pdf(store_path)
+    meta_path = Path(store_path) / "docs" / doc_id / "doc.json"
+    before = meta_path.read_text()
+    assert client.get_source_path(doc_id) == str(
+        Path(store_path) / doc_id / "document.pdf")
+    # The derivation writes nothing and records nothing in meta.
+    assert meta_path.read_text() == before
+    # A pure-local doc (no service layout) yields None, never an exception.
+    seed_doc(store_path, "pi-b", "payroll.pdf")
+    assert client.get_source_path("pi-b") is None
+
+
+def test_tool_names_page_images():
+    page = tool_names(page_images=True)
+    assert "get_document_image" in page
+    assert "get_page_content" not in page
+    # Default surfaces keep the contract set, management or not.
+    assert tool_names() == ("browse_documents", "get_document",
+                            "get_document_structure", "get_page_content")
+    assert tool_names(True) == tool_names() + ("remove_document",)
+    assert "get_document_image" not in tool_names(include_management=True)
+
+
+def test_chat_lane_prompt_wording(client):
+    from pageindex.agent_tools import (LOCAL_CITATION_PROMPTS,
+                                       _base_instructions,
+                                       _page_image_prompt)
+    swapped = _base_instructions(client, page_images=True)
+    assert "get_document_image()" in swapped
+    assert "get_page_content()" not in swapped
+    default = _base_instructions(client)
+    assert "get_page_content()" in default
+    assert "get_document_image()" not in default
+    # The frozen citation copies stay untouched; the lane's rewritten copy
+    # names only tools the lane ships.
+    lane_tools = set(tool_names(page_images=True))
+    for fmt, text in LOCAL_CITATION_PROMPTS.items():
+        assert "get_page_content()" in text
+        lane = _page_image_prompt(text)
+        assert "get_page_content()" not in lane
+        named = set(re.findall(r"\b(\w+)\(", lane))
+        assert named <= lane_tools
+
+
+def test_call_tool_image_text_envelope(client, store_path):
+    _seed_doc_with_pdf(store_path)
+    payload, is_error = run(client, "get_document_image",
+                            doc_name="report.pdf", page=1)
+    assert not is_error
+    assert payload["success"] is True
+    assert payload["page"] == 1 and payload["total_pages"] == 2
+    assert "image block" in payload["note"]
+    # Binary never rides the JSON envelope.
+    assert "data:image" not in json.dumps(payload)
+    assert len(json.dumps(payload)) < 2000
+    # call_tool scope applies to the image tool like every other one.
+    text, is_error = call_tool(client, "get_document_image",
+                               {"doc_name": "report.pdf", "page": 1},
+                               doc_ids=["pi-none"])
+    assert is_error and json.loads(text)["errorCode"] == "NOT_FOUND"
+
+
+def test_tool_specs_page_images_lane(client, store_path):
+    from pageindex.agent_tools import _tool_specs
+    _seed_doc_with_pdf(store_path)
+    specs = _tool_specs(client, page_images=True)
+    assert [spec[0] for spec in specs] == list(tool_names(page_images=True))
+    invokes = {name: invoke for name, _, _, invoke in specs}
+    # The image tool's invoke is the blocks face.
+    blocks, is_error = invokes["get_document_image"](
+        {"doc_name": "report.pdf", "page": 1})
+    assert not is_error and blocks[0]["type"] == "image"
+    # Text tools in the lane swap their next_steps wording.
+    blocks, is_error = invokes["get_document_structure"](
+        {"doc_name": "report.pdf"})
+    assert not is_error
+    assert "get_document_image()" in blocks[0]["text"]
+    assert "get_page_content()" not in blocks[0]["text"]
+    # The default specs keep the contract set and the frozen wording.
+    default_names = [spec[0] for spec in _tool_specs(client)]
+    assert default_names == list(tool_names())
+
+
 # ── remove_document (management-gated) ──
 
 def test_remove_document(client, store_path):

@@ -742,6 +742,16 @@ class PageIndexClient:
         """
         return self._api.get_ocr(doc_id=doc_id, format=format)
 
+    def get_source_path(self, doc_id: str) -> Optional[str]:
+        """
+        Local: the stored original PDF's path
+        (``<storage root>/<doc_id>/document.pdf`` — the service
+        deployment's layout), or None when no original is stored (pure
+        local libraries, or cloud documents, whose originals are remote).
+        """
+        getter = getattr(self._api, "get_source_path", None)
+        return getter(doc_id) if getter is not None else None
+
     def get_page_content(self, doc_id: str, pages: str) -> list[dict[str, Any]]:
         """
         Get text content of specific pages.
@@ -1237,6 +1247,12 @@ class PageIndexClient:
         if citations:
             if self._local_chat:
                 text = self.citation_prompt()
+                if not getattr(self, "api_key", None):
+                    # The local chat lanes run the page_images tool set;
+                    # their citation wording names the image tool. Cloud
+                    # own-model chat keeps the live prompt verbatim.
+                    from .agent_tools import _page_image_prompt
+                    text = _page_image_prompt(text)
                 if isinstance(instructions, list):
                     instructions = [{"type": "text", "text": text},
                                     *instructions]
