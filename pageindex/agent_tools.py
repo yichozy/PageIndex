@@ -28,6 +28,7 @@ import copy
 import difflib
 import inspect
 import json
+import os
 import re
 import threading
 import time
@@ -42,8 +43,19 @@ from .mcp_bridge import render_prompt_text, render_text
 TOOL_RESPONSE_CHAR_LIMIT = 100_000
 STRUCTURE_FIRST_PAGE_THRESHOLD = 20
 
-#: Render resolution (DPI) of the chat page-image tool.
-PAGE_IMAGE_DPI_DEFAULT = 150.0
+#: Render resolution (DPI) of the chat page-image tool. 110 keeps a
+#: 10pt body character ~15px tall (VLMs read reliably down to ~10px)
+#: while cutting vision tokens ~46% versus 150 (tokens scale with
+#: pixels, i.e. DPI²); vector text renders crisp at any DPI.
+PAGE_IMAGE_DPI_DEFAULT = 110.0
+
+
+def _page_image_dpi() -> float:
+    """The page-image render DPI, read at call time so a
+    PAGEINDEX_PAGE_IMAGE_DPI change applies without a restart (the
+    call-time env pattern vision.py's thresholds follow)."""
+    return float(os.environ.get("PAGEINDEX_PAGE_IMAGE_DPI",
+                                PAGE_IMAGE_DPI_DEFAULT))
 
 _CHAR_BUDGET = int(TOOL_RESPONSE_CHAR_LIMIT * 0.95)
 _MAX_REQUESTED_PAGES = 10_000
@@ -1245,7 +1257,7 @@ def _get_document_image(client, doc_name: str, page: Any,
             "doc_name": doc_name,
             "page": context["page"],
             "total_pages": context["total_pages"],
-            "dpi": PAGE_IMAGE_DPI_DEFAULT,
+            "dpi": _page_image_dpi(),
             "note": ("The rendered page image is delivered as an image "
                      "block on the chat surfaces that carry it; this text "
                      "envelope carries the metadata only."),
@@ -1281,7 +1293,7 @@ def _get_document_image_blocks(client, arguments: dict,
         payload, is_error = error
         return [{"type": "text", "text": _dumps(payload)}], is_error
     assert context is not None
-    dpi = PAGE_IMAGE_DPI_DEFAULT
+    dpi = _page_image_dpi()
     try:
         import pypdfium2 as pdfium
         from .vision import render_page_png

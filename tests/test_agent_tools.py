@@ -486,7 +486,7 @@ def test_get_document_image_success_blocks(client, store_path):
     assert payload["success"] is True
     assert payload["doc_name"] == "report.pdf"
     assert payload["page"] == 1 and payload["total_pages"] == 2
-    assert payload["dpi"] == 150.0
+    assert payload["dpi"] == 110.0
 
 
 def test_get_document_image_invalid_input(client, store_path):
@@ -519,6 +519,25 @@ def test_get_document_image_invalid_input(client, store_path):
     payload = run_blocks(doc_name="payroll.pdf", page=1)
     assert payload["errorCode"] == "INVALID_INPUT"
     assert "original PDF" in payload["error"]
+
+
+def test_page_image_dpi_env_read_at_call_time(client, store_path, monkeypatch):
+    from pageindex import agent_tools
+    _seed_doc_with_pdf(store_path)
+
+    monkeypatch.setenv("PAGEINDEX_PAGE_IMAGE_DPI", "110")
+    blocks, is_error = agent_tools._get_document_image_blocks(
+        client, {"doc_name": "report.pdf", "page": 1})
+    assert not is_error
+    assert json.loads(blocks[1]["text"])["dpi"] == 110.0
+
+    # Unset again: the default applies on the very next call, no
+    # re-import involved.
+    monkeypatch.delenv("PAGEINDEX_PAGE_IMAGE_DPI")
+    blocks, is_error = agent_tools._get_document_image_blocks(
+        client, {"doc_name": "report.pdf", "page": 1})
+    assert not is_error
+    assert json.loads(blocks[1]["text"])["dpi"] == 110.0
 
 
 def test_get_source_path_layout(client, store_path):
