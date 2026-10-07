@@ -474,7 +474,7 @@ def test_get_document_image_success_blocks(client, store_path):
     from pageindex.agent_tools import _get_document_image_blocks
     _seed_doc_with_pdf(store_path)
     blocks, is_error = _get_document_image_blocks(
-        client, {"doc_name": "report.pdf", "page": 1})
+        client, {"doc_name": "report.pdf", "pages": "1"})
     assert not is_error
     assert [block["type"] for block in blocks] == ["image", "text"]
     image, meta = blocks
@@ -485,8 +485,58 @@ def test_get_document_image_success_blocks(client, store_path):
     payload = json.loads(meta["text"])
     assert payload["success"] is True
     assert payload["doc_name"] == "report.pdf"
-    assert payload["page"] == 1 and payload["total_pages"] == 2
+    assert payload["pages"] == [1] and payload["total_pages"] == 2
     assert payload["dpi"] == 110.0
+
+
+def test_get_document_image_multi_page_blocks(client, store_path):
+    """The multi-page batch: one image block per page in ascending order,
+    then a single metadata block. The batch exists because every tool
+    call is a model round trip over the whole history — fetching a
+    section spanning pages in one call is the round-trip saving."""
+    from pageindex.agent_tools import _get_document_image_blocks
+    _seed_doc_with_pdf(store_path)  # report.pdf, 2 pages
+    blocks, is_error = _get_document_image_blocks(
+        client, {"doc_name": "report.pdf", "pages": "2,1"})
+    assert not is_error
+    assert [block["type"] for block in blocks] == ["image", "image", "text"]
+    import base64
+    for image in blocks[:2]:
+        assert image["mimeType"] == "image/png"
+        assert base64.b64decode(image["data"])[:8] == b"\x89PNG\r\n\x1a\n"
+    payload = json.loads(blocks[2]["text"])
+    # The spec "2,1" parses to the sorted deduplicated list; the images
+    # follow the same order, so image i is page payload["pages"][i].
+    assert payload["pages"] == [1, 2]
+    assert payload["total_pages"] == 2
+
+
+def test_get_document_image_page_batch_cap(client, store_path):
+    """Over five pages in one request is rejected with split guidance —
+    the cap keeps an over-broad fetch from eating the context with
+    vision tokens that persist for the rest of the chat."""
+    from pageindex.agent_tools import _get_document_image_blocks
+    _seed_doc_with_pdf(store_path)
+    blocks, is_error = _get_document_image_blocks(
+        client, {"doc_name": "report.pdf", "pages": "1-6"})
+    assert is_error
+    payload = json.loads(blocks[0]["text"])
+    assert payload["errorCode"] == "INVALID_INPUT"
+    assert payload["max_pages_per_call"] == 5
+    assert any("Split the request" in option
+               for option in payload["next_steps"]["options"])
+
+
+def test_get_document_image_integer_pages_coerced(client, store_path):
+    """A bare integer against the string schema is the likeliest model
+    slip and unambiguous — accepted rather than bounced."""
+    from pageindex.agent_tools import _get_document_image_blocks
+    _seed_doc_with_pdf(store_path)
+    blocks, is_error = _get_document_image_blocks(
+        client, {"doc_name": "report.pdf", "pages": 2})
+    assert not is_error
+    payload = json.loads(blocks[1]["text"])
+    assert payload["pages"] == [2]
 
 
 def test_get_document_image_invalid_input(client, store_path):
@@ -503,20 +553,24 @@ def test_get_document_image_invalid_input(client, store_path):
     seed_doc(store_path, "pi-b", "payroll.pdf")  # no stored original
 
     # Outside the chat scope: the same NOT_FOUND as every other tool.
-    payload = run_blocks(doc_ids="pi-a", doc_name="payroll.pdf", page=1)
+    payload = run_blocks(doc_ids="pi-a", doc_name="payroll.pdf", pages="1")
     assert payload["errorCode"] == "NOT_FOUND"
     # Page out of range: the envelope carries the usable page count.
-    payload = run_blocks(doc_name="report.pdf", page=3)
+    payload = run_blocks(doc_name="report.pdf", pages="3")
     assert payload["errorCode"] == "INVALID_INPUT"
     assert payload["total_pages"] == 2
     assert any("between 1 and 2" in option
                for option in payload["next_steps"]["options"])
-    # Non-integer page.
-    payload = run_blocks(doc_name="report.pdf", page="1")
+    # Unparseable page spec.
+    payload = run_blocks(doc_name="report.pdf", pages="x")
     assert payload["errorCode"] == "INVALID_INPUT"
-    assert "positive" in payload["error"]
+    assert "page specification" in payload["error"].lower()
+    # Non-string, non-integer pages value.
+    payload = run_blocks(doc_name="report.pdf", pages=["1"])
+    assert payload["errorCode"] == "INVALID_INPUT"
+    assert "pages must be" in payload["error"]
     # No stored original: explicit INVALID_INPUT, not a bare exception.
-    payload = run_blocks(doc_name="payroll.pdf", page=1)
+    payload = run_blocks(doc_name="payroll.pdf", pages="1")
     assert payload["errorCode"] == "INVALID_INPUT"
     assert "original PDF" in payload["error"]
 
@@ -527,7 +581,7 @@ def test_page_image_dpi_env_read_at_call_time(client, store_path, monkeypatch):
 
     monkeypatch.setenv("PAGEINDEX_PAGE_IMAGE_DPI", "110")
     blocks, is_error = agent_tools._get_document_image_blocks(
-        client, {"doc_name": "report.pdf", "page": 1})
+        client, {"doc_name": "report.pdf", "pages": "1"})
     assert not is_error
     assert json.loads(blocks[1]["text"])["dpi"] == 110.0
 
@@ -535,7 +589,7 @@ def test_page_image_dpi_env_read_at_call_time(client, store_path, monkeypatch):
     # re-import involved.
     monkeypatch.delenv("PAGEINDEX_PAGE_IMAGE_DPI")
     blocks, is_error = agent_tools._get_document_image_blocks(
-        client, {"doc_name": "report.pdf", "page": 1})
+        client, {"doc_name": "report.pdf", "pages": "1"})
     assert not is_error
     assert json.loads(blocks[1]["text"])["dpi"] == 110.0
 
@@ -588,17 +642,17 @@ def test_chat_lane_prompt_wording(client):
 def test_call_tool_image_text_envelope(client, store_path):
     _seed_doc_with_pdf(store_path)
     payload, is_error = run(client, "get_document_image",
-                            doc_name="report.pdf", page=1)
+                            doc_name="report.pdf", pages="1")
     assert not is_error
     assert payload["success"] is True
-    assert payload["page"] == 1 and payload["total_pages"] == 2
+    assert payload["pages"] == [1] and payload["total_pages"] == 2
     assert "image block" in payload["note"]
     # Binary never rides the JSON envelope.
     assert "data:image" not in json.dumps(payload)
     assert len(json.dumps(payload)) < 2000
     # call_tool scope applies to the image tool like every other one.
     text, is_error = call_tool(client, "get_document_image",
-                               {"doc_name": "report.pdf", "page": 1},
+                               {"doc_name": "report.pdf", "pages": "1"},
                                doc_ids=["pi-none"])
     assert is_error and json.loads(text)["errorCode"] == "NOT_FOUND"
 
@@ -611,7 +665,7 @@ def test_tool_specs_page_images_lane(client, store_path):
     invokes = {name: invoke for name, _, _, invoke in specs}
     # The image tool's invoke is the blocks face.
     blocks, is_error = invokes["get_document_image"](
-        {"doc_name": "report.pdf", "page": 1})
+        {"doc_name": "report.pdf", "pages": "1"})
     assert not is_error and blocks[0]["type"] == "image"
     # Text tools in the lane swap their next_steps wording.
     blocks, is_error = invokes["get_document_structure"](

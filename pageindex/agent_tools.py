@@ -49,6 +49,15 @@ STRUCTURE_FIRST_PAGE_THRESHOLD = 20
 #: pixels, i.e. DPI²); vector text renders crisp at any DPI.
 PAGE_IMAGE_DPI_DEFAULT = 110.0
 
+#: Pages per get_document_image call. Each rendered page costs ~800
+#: vision tokens that persist in the conversation for the rest of the
+#: chat, so a batch is bounded the way the text tool's page budget is
+#: not: enough to fetch a section spanning a page break in one round
+#: trip (the round trip — full-history prefill plus a model turn — is
+#: what batching exists to save), small enough that an over-broad
+#: "just fetch 1-20" cannot silently eat the context.
+PAGE_IMAGE_MAX_PAGES = 5
+
 
 def _page_image_dpi() -> float:
     """The page-image render DPI, read at call time so a
@@ -1149,14 +1158,15 @@ def _get_page_content(client, doc_name: str, pages: str,
 # ── chat page-image tool (the page_images lane's reading surface) ──
 
 def _page_image_context(
-        client, doc_name: str, page: Any,
+        client, doc_name: str, pages: Any,
         _allowed_ids: Optional[frozenset] = None,
 ) -> "tuple[Optional[dict[str, Any]], Optional[_ToolResult]]":
-    """Validate one page-image request: scope, status, page bounds, and
-    the stored original PDF. Returns (context, None) — context carries
-    entry / page / total_pages / source_path — or (None, error pair).
-    Shared by both faces of the tool: the dict envelope never renders,
-    the blocks face never re-validates."""
+    """Validate one page-image request: scope, status, page-spec shape,
+    the per-call page cap, page bounds, and the stored original PDF.
+    Returns (context, None) — context carries entry / pages (the sorted
+    deduplicated page list) / total_pages / source_path — or (None,
+    error pair). Shared by both faces of the tool: the dict envelope
+    never renders, the blocks face never re-validates."""
     entry, error = _resolve_document(client, doc_name,
                                      allowed_ids=_allowed_ids)
     if error is not None:
@@ -1165,16 +1175,43 @@ def _page_image_context(
     if entry.get("status") != "completed":
         return None, _not_ready_error(doc_name, entry.get("status"),
                                       "page image retrieval", False)
-    if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+    # A bare integer is the likeliest slip against the string schema and
+    # unambiguous — accept it rather than bounce a readable request.
+    if isinstance(pages, int) and not isinstance(pages, bool):
+        pages = str(pages)
+    if not isinstance(pages, str):
         return None, _failure(
-            f"page must be a positive 1-based integer (the first page is "
-            f"page 1), got {page!r}",
+            f"pages must be a page specification string such as \"3\", "
+            f"\"3-5\", or \"3,7\", got {pages!r}",
             {"doc_name": doc_name},
             {
-                "summary": "Invalid page number",
+                "summary": "Invalid pages parameter",
                 "options": [
-                    "Pass page as an integer, e.g. page: 1",
+                    'Use valid formats: "5", "3,7,10", or "5-8"',
                     "Use get_document() to check the document's page count",
+                ],
+            },
+            "INVALID_INPUT",
+        )
+    requested, error = _parse_page_spec(pages, doc_name)
+    if error is not None:
+        return None, error
+    assert requested is not None
+    if len(requested) > PAGE_IMAGE_MAX_PAGES:
+        return None, _failure(
+            f"Too many pages for one image request: {len(requested)} "
+            f"requested, at most {PAGE_IMAGE_MAX_PAGES} per call (each "
+            f"rendered page costs several hundred vision tokens that stay "
+            f"in the conversation).",
+            {"doc_name": doc_name, "requested_pages": requested,
+             "max_pages_per_call": PAGE_IMAGE_MAX_PAGES},
+            {
+                "summary": "The page batch is too large",
+                "options": [
+                    f"Split the request into batches of at most "
+                    f"{PAGE_IMAGE_MAX_PAGES} pages",
+                    "Use get_document_structure() to locate the few pages "
+                    "that actually carry the answer",
                 ],
             },
             "INVALID_INPUT",
@@ -1206,11 +1243,12 @@ def _page_image_context(
             },
             "INTERNAL_ERROR",
         )
-    if page > total:
+    over = [page for page in requested if page > total]
+    if over:
         return None, _failure(
-            f"Page {page} is out of range. Document has {total} pages.",
+            f"Page {over[0]} is out of range. Document has {total} pages.",
             {"doc_name": doc_name, "total_pages": total,
-             "requested_page": page},
+             "requested_pages": requested},
             {
                 "summary": "Requested page is out of range",
                 "options": [
@@ -1237,17 +1275,17 @@ def _page_image_context(
             },
             "INVALID_INPUT",
         )
-    return {"entry": entry, "page": page, "total_pages": total,
+    return {"entry": entry, "pages": requested, "total_pages": total,
             "source_path": path}, None
 
 
-def _get_document_image(client, doc_name: str, page: Any,
+def _get_document_image(client, doc_name: str, pages: Any,
                         _allowed_ids: Optional[frozenset] = None,
                         ) -> tuple[dict, bool]:
     """The call_tool text face: the same validation and metadata envelope
-    as the chat lane's image blocks, minus the image — binary content
+    as the chat lane's image blocks, minus the images — binary content
     never rides a JSON envelope."""
-    context, error = _page_image_context(client, doc_name, page,
+    context, error = _page_image_context(client, doc_name, pages,
                                          _allowed_ids)
     if error is not None:
         return error
@@ -1255,19 +1293,19 @@ def _get_document_image(client, doc_name: str, page: Any,
     return _success(
         {
             "doc_name": doc_name,
-            "page": context["page"],
+            "pages": context["pages"],
             "total_pages": context["total_pages"],
             "dpi": _page_image_dpi(),
-            "note": ("The rendered page image is delivered as an image "
-                     "block on the chat surfaces that carry it; this text "
+            "note": ("The rendered page images are delivered as image "
+                     "blocks on the chat surfaces that carry it; this text "
                      "envelope carries the metadata only."),
         },
         {
-            "summary": (f"Page {context['page']} of "
+            "summary": (f"Pages {_format_page_spec(context['pages'])} of "
                         f"{context['total_pages']} validated for "
                         "rendering."),
             "options": [
-                f"View other pages with page: 1-{context['total_pages']}",
+                f"View other pages with pages: 1-{context['total_pages']}",
             ],
         },
     )
@@ -1276,8 +1314,9 @@ def _get_document_image(client, doc_name: str, page: Any,
 def _get_document_image_blocks(client, arguments: dict,
                                doc_ids=None) -> tuple[list, bool]:
     """The chat lanes' face: MCP content blocks — the page as a PNG image
-    block first, its citation metadata (doc_name/page/dpi) as a text
-    block after. Every block is a structured MCP content dict: the
+    one PNG image block per requested page (ascending), then a single
+    text block carrying the citation metadata (doc_name/pages/dpi).
+    Every block is a structured MCP content dict: the
     Agents SDK drops the image if the block list mixes in a bare
     string. Validation failures collapse to one text block carrying the
     same error envelope as the text face."""
@@ -1287,26 +1326,31 @@ def _get_document_image_blocks(client, arguments: dict,
         ids = [doc_ids] if isinstance(doc_ids, str) else doc_ids
         allowed = frozenset(str(one_id) for one_id in ids)
     context, error = _page_image_context(
-        client, kwargs.get("doc_name"), kwargs.get("page"),
+        client, kwargs.get("doc_name"), kwargs.get("pages"),
         _allowed_ids=allowed)
     if error is not None:
         payload, is_error = error
         return [{"type": "text", "text": _dumps(payload)}], is_error
     assert context is not None
     dpi = _page_image_dpi()
+    rendered = []
     try:
         import pypdfium2 as pdfium
         from .vision import render_page_png
         pdf = pdfium.PdfDocument(context["source_path"])
         try:
-            data = render_page_png(pdf, context["page"] - 1, dpi)
+            for page in context["pages"]:
+                rendered.append({"type": "image",
+                                 "data": render_page_png(pdf, page - 1, dpi),
+                                 "mimeType": "image/png"})
         finally:
             pdf.close()
     except Exception as exc:
         payload, is_error = _failure(
-            f"Failed to render page {context['page']}: {exc}",
+            f"Failed to render page "
+            f"{context['pages'][len(rendered)]}: {exc}",
             {"doc_name": context["entry"].get("name"),
-             "page": context["page"]},
+             "pages": context["pages"]},
             {
                 "summary": "Page rendering failed",
                 "options": ["Try the request again",
@@ -1320,24 +1364,24 @@ def _get_document_image_blocks(client, arguments: dict,
     payload, _ = _success(
         {
             "doc_name": context["entry"].get("name"),
-            "page": context["page"],
+            "pages": context["pages"],
             "total_pages": context["total_pages"],
             "dpi": dpi,
-            "note": ("Image block rendered from the stored original PDF; "
-                     "cite this page number for anything read from it."),
+            "note": ("Image blocks rendered from the stored original PDF; "
+                     "each image is the page at its position in this "
+                     "list — cite that page number for anything read "
+                     "from it."),
         },
         {
-            "summary": (f"Page {context['page']} of "
+            "summary": (f"Pages {_format_page_spec(context['pages'])} of "
                         f"{context['total_pages']} rendered."),
             "options": [
-                f"View other pages with page: 1-{context['total_pages']}",
+                f"View other pages with pages: 1-{context['total_pages']}",
             ],
         },
     )
-    return [
-        {"type": "image", "data": data, "mimeType": "image/png"},
-        {"type": "text", "text": _dumps(payload)},
-    ], False
+    rendered.append({"type": "text", "text": _dumps(payload)})
+    return rendered, False
 
 
 def _remove_document(client, doc_names: list[str],
@@ -1540,13 +1584,13 @@ _LOCAL_PARAM_DESCRIPTIONS: dict[tuple[str, str], str] = {
 #: its live cloud schema on the bridge path.
 _PAGE_IMAGE_TOOL: dict[str, Any] = {
     "description": (
-        "View one page of a document as a rendered image. This is the "
-        "reading tool: figures, charts, diagrams, tables, and any "
-        "graphical content are read from the image, and the metadata "
-        "beside each image carries the page number for citations. Locate "
-        "candidate pages with get_document_structure() (or get_document() "
-        "for the page count), then view them one at a time — one page "
-        "per call."
+        "View document pages as rendered images. This is the reading "
+        "tool: figures, charts, diagrams, tables, and any graphical "
+        "content are read from the images, and the metadata beside them "
+        "carries the page numbers for citations. Locate candidate pages "
+        "with get_document_structure() (or get_document() for the page "
+        "count), then view them — up to 5 pages per call, one image per "
+        "page in ascending order."
     ),
     "schema": {
         "type": "object",
@@ -1555,17 +1599,18 @@ _PAGE_IMAGE_TOOL: dict[str, Any] = {
                 "type": "string",
                 "description": _LOCAL_DOC_NAME_DESCRIPTION,
             },
-            "page": {
-                "type": "integer",
-                "minimum": 1,
+            "pages": {
+                "type": "string",
                 "description": (
-                    "Page number to view, 1-based (page 1 is the first "
-                    "page). One page per call; use get_document_structure() "
-                    "to locate the right pages first."
+                    'Pages to view, 1-based, e.g. "5", "3,7,10", or '
+                    '"5-8" — at most 5 pages per call (each rendered '
+                    "page costs several hundred vision tokens). Use "
+                    "get_document_structure() to locate the right pages "
+                    "first."
                 ),
             },
         },
-        "required": ["doc_name", "page"],
+        "required": ["doc_name", "pages"],
     },
 }
 
@@ -1866,9 +1911,9 @@ READING WORKFLOW:
 
 _READING_WORKFLOW_PAGE_IMAGES = f"""\
 READING WORKFLOW:
-- For documents over {STRUCTURE_FIRST_PAGE_THRESHOLD} pages: call get_document_structure() first to locate relevant pages, then get_document_image() to view those pages one at a time.
-- For small documents ({STRUCTURE_FIRST_PAGE_THRESHOLD} pages or fewer): call get_document_image() directly, page by page.
-- Read everything from the returned page image — figures, charts, tables, and text alike — and cite the page number the tool's metadata reports."""
+- For documents over {STRUCTURE_FIRST_PAGE_THRESHOLD} pages: call get_document_structure() first to locate relevant pages, then get_document_image() to view them — batch adjacent pages into one call (e.g. pages "5-7"), at most 5 pages per call.
+- For small documents ({STRUCTURE_FIRST_PAGE_THRESHOLD} pages or fewer): call get_document_image() directly.
+- Read everything from the returned page images — figures, charts, tables, and text alike — and cite the page numbers the tool's metadata reports."""
 
 _TOOL_USAGE_RULES = """\
 TOOL USAGE RULES:
