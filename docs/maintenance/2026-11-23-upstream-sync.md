@@ -41,3 +41,42 @@
 在 `/tmp/pageindex-sync-venv` 隔离环境安装 `-e '.[claude,anthropic]' pytest`，运行完整 pytest。真实云服务和真实模型端到端行为不属于本次离线回归验证范围。
 
 最终结果：**1345 passed, 7 skipped**，耗时 81.80 秒；`git diff --check` 通过。7 项跳过不能计作通过。测试环境包含 OpenAI 3.57.0、openai-agents 0.25.0、LiteLLM 1.110.2、Anthropic 2.12.0 和 claude-agent-sdk 0.2.187。
+
+## 官方更新摘要
+
+以下是从共同祖先到 add6b17 的最终更新方向，不将期间中间依赖版本调整逐条作为当前行为：
+
+| 方向 | 内容 | 官方提交/PR |
+| --- | --- | --- |
+| 树结构与导航 | 本地和云端统一文档树；补充 intro/expand 修复；新增 get_node、get_node_parent、get_node_path、get_node_map | 6d23caf / #541、d57adcd / #554、60c8ff8 / #542 |
+| Flash 性能与准确性 | 优化索引；摘要从深层开始并与 expand 重叠；顺序解析一次保留一页；修复字体字符间距、目录运行链接误遮标题、非拉丁标题和不可解析回复重试 | #566、#432、#645、#553、#577、#588、#571 |
+| 推理、协议与用量 | 各协议保留推理上下文；统一 SDK 重试规则；返回运行消息；Messages 流支持 get_final_result；本地索引/聊天报告用量，含失败路径 | #622、#612、#607、#572、#659 |
+| Claude | claude-code/ 通过 Claude 订阅执行索引和聊天；改进登录错误、SDK 兼容及密钥传递 | #595、#603、#600、#594、#626 |
+| 云端搜索与提取 | 新增搜索页面/文档、PDF JSON 提取和页面/区域图片；拆出 PageSearchClient、PageExtractClient；支持稍后建立 outline 索引；改善重复上传/失败任务恢复 | #677、#681、#686、#690、#691 |
+| 集合与元数据 | 集合创建/列表/删除、集合上传、chat(collection_id=)、元数据 schema 管理、collection_context | 1300606、#625、#668、#692 |
+| 引用、命名与列表 | 引用链接/区域高亮/路径解析；过滤模型未见图片的引用框；统一命名规则、修复列表递归及边界 | #525、#524、#632、#673、ed06ec6、2a73636 |
+| 模型、依赖和资料 | 更新默认模型及依赖下限；扩充 README、本地使用指南、Claude/引用/元数据/费用对比 notebook；整理仓库布局与 CI | #568、#539、#693、#694、#696 |
+
+## 实际合并流程与证据
+
+1. 检查工作区：开始时没有未提交改动；确认 origin 指向本地 fork，记录本地 HEAD。
+2. 使用 `git fetch https://github.com/VectifyAI/PageIndex.git main` 获取官方 main，固定 FETCH_HEAD 为 add6b17；此次没有新增名为 upstream 的 remote。
+3. 用 merge-base、rev-list --left-right --count、log 和 diff 比较双方；用 git cherry 检查补丁等价性。没有等价补丁不等于没有功能重叠，因此另行检查相关实现。
+4. 创建 codex/sync-upstream-2026-11-23，执行 `git merge --no-commit --no-ff add6b17`。采用 merge 保留双方历史；没有 rebase 或重置本地代码。
+5. 解决 10 个冲突文件：agent_tools.py、client.py、cloud_api.py、integrations/anthropic_sdk.py、integrations/openai_agents.py、local_api.py、local_chat.py、utils.py、tests/test_client.py、tests/test_local_chat.py。核心取舍见前文重叠表；继续检查自动合并后的签名和字段变化。
+6. 编译检查、diff --check，并在临时隔离环境安装项目及可选依赖后运行全量测试。初轮 1341 passed、7 skipped、4 failed；修正流式空响应处理及测试兼容后，最终 1345 passed、7 skipped。
+7. 生成双父 merge 提交 `1c20e353ab78ad4bf64dc2a7ed3b047ccd3ef0c2`，确认 add6b17 是 HEAD 祖先、工作区干净；没有推送或发布。
+
+复查历史不需要依赖 FETCH_HEAD：
+
+```sh
+git merge-base 376352f add6b17
+git rev-list --left-right --count 376352f...add6b17
+git cherry add6b17 376352f
+git show --no-patch --format='%H %P' 1c20e35
+git merge-base --is-ancestor add6b17 1c20e35
+```
+
+验证命令：隔离环境 Python 执行 `-m pytest -q --disable-warnings --maxfail=5`。测试记录的 186 个 warnings 未逐项消除；本次没有验证真实云服务、真实模型和下游业务项目。
+
+后续维护入口：[本地定制台账](local-changes.md)、[官方同步历史](upstream-sync-history.md)。本节及两个台账于本次同步之后补录，未修改产品行为。
