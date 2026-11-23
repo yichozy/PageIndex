@@ -1,36 +1,42 @@
 """PageIndex SDK."""
 from typing import TYPE_CHECKING as _TYPE_CHECKING
 
-from .chat_stream import ChatStream
+from .chat_stream import ChatStream, MessagesStream, ChatObject
 from .client import PageIndexClient, PageIndexCloudClient, PageIndexLocalClient
 from .errors import PageIndexAPIError
+from .page_extract import PageExtractClient
+from .page_search import PageSearchClient
 from .types import (ChatConfig, ChatProcessOptions, CloudIndexConfig,
                     IndexConfig, LocalIndexConfig)
 
 if _TYPE_CHECKING:
     from .flash import page_index_flash
+    from .imaging import highlight_region
     from .page_index_classic import page_index, page_index_main
     from .page_index_md import md_to_tree
     from .tree_optimize import optimize_tree
 
 __all__ = [
     "PageIndexClient", "PageIndexCloudClient", "PageIndexLocalClient",
+    "PageSearchClient", "PageExtractClient",
     "PageIndexAPIError",
     "IndexConfig", "CloudIndexConfig", "LocalIndexConfig", "ChatConfig",
-    "ChatProcessOptions", "ChatStream",
+    "ChatProcessOptions", "ChatStream", "MessagesStream", "ChatObject",
     "page_index", "page_index_main", "page_index_flash",
-    "optimize_tree", "md_to_tree",
+    "optimize_tree", "md_to_tree", "highlight_region",
 ]
 
 _LAZY = {
+    "highlight_region": ".imaging",
     "page_index_flash": ".flash",
     "optimize_tree": ".tree_optimize",
     "md_to_tree": ".page_index_md",
 }
 _SUBMODULES = {"agent_tools", "chat_stream", "client", "cloud_api", "errors",
-               "flash", "integrations", "local_api", "local_chat",
-               "local_store", "mcp_bridge", "page_index_classic",
-               "page_index_md", "tree_optimize", "types", "utils"}
+               "flash", "imaging", "integrations", "local_api", "local_chat",
+               "local_store", "mcp_bridge", "page_extract", "page_index_classic",
+               "page_index_md", "page_search", "retry", "tree_optimize", "types",
+               "utils"}
 
 
 def __getattr__(name):

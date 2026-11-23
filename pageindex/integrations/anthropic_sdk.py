@@ -27,7 +27,8 @@ from ..errors import PageIndexAPIError
 def build_anthropic_tools(client, include_management: bool = False,
                           asynchronous: bool = False, doc_ids=None,
                           failures: Optional[list] = None,
-                          page_images: bool = False) -> list:
+                          page_images: bool = False, collection: Optional[str] = None,
+                          seen=None) -> list:
     """``failures`` records the invoker's re-raised failures for
     chat(protocol="messages") to fail fast on."""
     try:
@@ -37,7 +38,7 @@ def build_anthropic_tools(client, include_management: bool = False,
     except ImportError as exc:
         raise PageIndexAPIError(
             "as_anthropic_tools requires the Anthropic SDK tool runner "
-            "(anthropic>=0.108.0) — pip install -U anthropic (or pip install "
+            "— pip install -U anthropic (or pip install "
             "'pageindex[anthropic]')."
         ) from exc
     from mcp.types import CallToolResult
@@ -82,4 +83,5 @@ def build_anthropic_tools(client, include_management: bool = False,
 
     return [wrap(*spec)
             for spec in _tool_specs(client, include_management,
-                                    doc_ids=doc_ids, page_images=page_images)]
+                                    doc_ids=doc_ids, page_images=page_images, collection=collection,
+                                    seen=seen)]

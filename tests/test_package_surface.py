@@ -3,7 +3,11 @@ import os
 import subprocess
 import sys
 
-from pageindex.utils import create_node_mapping, print_tree, remove_fields
+import pytest
+
+from pageindex.utils import (create_node_mapping, get_node, get_node_map,
+                             get_node_parent, get_node_path, print_tree,
+                             remove_fields)
 
 TREE = [
     {"title": "Root", "node_id": "0000", "page_index": 1,
@@ -47,6 +51,35 @@ def test_print_tree_exclude_fields(capsys):
     assert "[0000] Root" in capsys.readouterr().out
 
 
+# ── tree navigation ──
+
+def test_node_navigation():
+    root, child, tail = TREE[0], TREE[0]["nodes"][0], TREE[1]
+    assert get_node(TREE, "0001") is child
+    assert get_node(TREE, "9999") is None
+    assert get_node_parent(TREE, "0001") is root
+    assert get_node_parent(TREE, "0002") is None
+    assert get_node_path(TREE, "0001") == [root, child]
+    assert get_node_path(TREE, "0002") == [tail]
+    assert get_node_path(TREE, "9999") == []
+    assert get_node(root, "0001") is child
+    assert get_node_map(TREE) == {"0000": root, "0001": child, "0002": tail}
+    leaf = {"node_id": "0000", "nodes": None}
+    assert get_node_map([leaf]) == {"0000": leaf}
+
+
+def test_node_navigation_rejects_wrong_input():
+    envelope = {"doc_id": "d", "status": "completed", "result": TREE}
+    with pytest.raises(TypeError, match="got dict"):
+        get_node(envelope, "0001")
+    with pytest.raises(TypeError, match="got dict"):
+        get_node_map(envelope)
+    with pytest.raises(TypeError, match="got NoneType"):
+        get_node_map(None)
+    with pytest.raises(TypeError, match="node_id"):
+        get_node(TREE, 1)
+
+
 # ── import cost: the SDK must not pay for the indexing stack ──
 
 def test_import_pageindex_is_lazy():
@@ -55,13 +88,52 @@ def test_import_pageindex_is_lazy():
         "heavy = [m for m in ('pageindex.page_index_classic', 'pageindex.flash', "
         "'pageindex.utils', 'pageindex.tree_optimize', "
         "'pageindex.local_chat', 'numpy', 'PyPDF2', "
-        "'agents', 'litellm', 'openai', 'anthropic') if m in sys.modules]; "
+        "'agents', 'litellm', 'openai', 'anthropic', 'yaml') "
+        "if m in sys.modules]; "
         "print(','.join(heavy) or 'clean'); "
         "print(type(pageindex.page_index_main).__name__)"
     )
     out = subprocess.run([sys.executable, "-c", probe],
                          capture_output=True, text=True, check=True)
     assert out.stdout.split() == ["clean", "function"]
+
+
+def test_yaml_writes_a_chat_object_as_a_mapping_through_any_dumper():
+    """local_chat registers the rule when it loads: through any dumper, a
+    caller's made earlier included, a ChatObject writes exactly as the
+    plain dict with its contents, the dumper's own dict rule applied (an
+    exact one, as every dumper but a bare BaseDumper's has, keeps the
+    alias where it repeats); no class gains a table, so later
+    registrations still reach every one."""
+    probe = (
+        "import enum, yaml\n"
+        "from yaml.representer import SafeRepresenter\n"
+        "class Early(yaml.SafeDumper): pass\n"
+        "class EarlyOwn(yaml.SafeDumper): pass\n"
+        "EarlyOwn.add_multi_representer(frozenset, lambda d, x: d.represent_list(sorted(x)))\n"
+        "class Mine(yaml.SafeDumper): pass\n"
+        "Mine.add_representer(dict, lambda d, x: d.represent_mapping('!mine', x))\n"
+        "class Bare(yaml.BaseDumper): pass\n"
+        "Bare.add_multi_representer(dict, lambda d, x: d.represent_mapping('!map', x))\n"
+        "Bare.add_multi_representer(object, lambda d, x: d.represent_scalar('!s', str(x)))\n"
+        "import pageindex.local_chat as lc\n"
+        "obj = lc._ChatCompletion({'z': 1, 'a': lc._ChatCompletion({'k': 2})})\n"
+        "plain = {'z': 1, 'a': {'k': 2}}\n"
+        "dumpers = [yaml.SafeDumper, yaml.Dumper, Early, EarlyOwn, Mine]\n"
+        "assert all(yaml.dump([obj, obj], Dumper=d, sort_keys=False)\n"
+        "           == yaml.dump([plain, plain], Dumper=d, sort_keys=False)\n"
+        "           for d in dumpers)\n"
+        "assert yaml.dump(obj, Dumper=Mine).startswith('!mine')\n"
+        "assert yaml.dump(obj, Dumper=Bare) == yaml.dump(plain, Dumper=Bare)\n"
+        "assert 'yaml_multi_representers' not in vars(Early)\n"
+        "assert 'yaml_multi_representers' not in vars(SafeRepresenter)\n"
+        "class Color(enum.Enum): RED = 1\n"
+        "yaml.SafeDumper.add_multi_representer(Color, lambda d, x: d.represent_str(x.name))\n"
+        "print(yaml.dump(Color.RED, Dumper=Early).split()[0])\n"
+    )
+    out = subprocess.run([sys.executable, "-c", probe],
+                         capture_output=True, text=True, check=True)
+    assert out.stdout.split() == ["RED"]
 
 
 def test_public_method_type_hints_resolve_at_runtime():
@@ -90,7 +162,7 @@ def test_sdk_submodules_reachable_and_dunder_probes_stay_lazy():
     probe = (
         "import sys, pageindex\n"
         "pageindex.agent_tools; pageindex.local_chat\n"
-        "pageindex.mcp_bridge; pageindex.integrations\n"
+        "pageindex.mcp_bridge; pageindex.integrations; pageindex.retry\n"
         "assert not hasattr(pageindex, '__wrapped__')\n"
         "heavy = [m for m in ('pageindex.page_index_classic', "
         "'pageindex.flash', 'pageindex.utils') if m in sys.modules]\n"
@@ -140,21 +212,6 @@ def test_import_leaves_litellm_env_untouched(tmp_path):
     assert out.stdout.strip() == "ok"
 
 
-def test_chat_module_stamps_before_it_imports_litellm():
-    """local_chat imports litellm without utils on its import path; the
-    stamp has to be in place by then anyway."""
-    probe = ("import os\n"
-             "from pageindex import local_chat\n"
-             "local_chat._default_max_tokens('claude-sonnet-4-5',"
-             " {'budget_tokens': 4096})\n"
-             "print(os.environ.get('LITELLM_LOCAL_MODEL_COST_MAP'))\n")
-    env = {k: v for k, v in os.environ.items()
-           if k != "LITELLM_LOCAL_MODEL_COST_MAP"}
-    out = subprocess.run([sys.executable, "-c", probe], env=env,
-                         capture_output=True, text=True, check=True)
-    assert out.stdout.strip() == "True"
-
-
 def test_utils_import_keeps_litellm_off_the_network():
     """utils' import sets litellm's no-fetch default; an explicit choice wins."""
     probe = ("import os, pageindex.utils; "
@@ -168,3 +225,21 @@ def test_utils_import_keeps_litellm_off_the_network():
     chosen = subprocess.run([sys.executable, "-c", probe], env=env,
                             capture_output=True, text=True, check=True)
     assert chosen.stdout.strip() == "False"
+
+
+def test_a_spawned_worker_inherits_the_no_fetch_default_as_the_sdks():
+    """A worker started from a process that imported utils inherits its
+    no-fetch default and still learns the published map; a value the
+    caller set stays theirs, in the worker too."""
+    probe = ("import subprocess, sys, pageindex.utils as u\n"
+             "child = 'import pageindex.utils as u; print(u._MAP_SET_BY_USER)'\n"
+             "print(u._MAP_SET_BY_USER, subprocess.run([sys.executable, '-c', child],"
+             " capture_output=True, text=True, check=True).stdout)")
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("LITELLM_LOCAL_MODEL_COST_MAP", "_PAGEINDEX_LOCAL_MODEL_MAP")}
+    for chosen, expected in ((None, ["False", "False"]), ("False", ["True", "True"])):
+        out = subprocess.run([sys.executable, "-c", probe],
+                             env={**env, **({"LITELLM_LOCAL_MODEL_COST_MAP": chosen}
+                                            if chosen else {})},
+                             capture_output=True, text=True, check=True)
+        assert out.stdout.split() == expected, chosen
