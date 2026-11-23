@@ -10,13 +10,14 @@ Either way the tool set reaches the framework as an MCP server (an
 in-process one over the bridge or the local store), and the FunctionTools
 are the framework's own conversion of it: the schema goes to the model
 verbatim, and tool results reach it in the framework's shapes (text as
-text, images as images). The SDK carries MCP types and renders nothing.
+text, images as images, except on its OpenAIChatCompletionsModel, which
+keeps only text). The SDK carries MCP types and renders nothing.
 """
 from __future__ import annotations
 
 import asyncio
 
-from ..errors import PageIndexAPIError, _pageindex_cause
+from ..errors import _pageindex_cause
 
 
 def _tool_failure(ctx, error):
@@ -31,13 +32,14 @@ def _tool_failure(ctx, error):
 
 
 def build_mcp_server(client, include_management: bool = False, doc_ids=None,
-                     page_images: bool = False):
+                     page_images: bool = False, collection=None, seen=None):
     """The tool set as an in-process MCP server for the Agents SDK."""
     from agents.mcp import MCPServer
     from mcp import types as mcp_types
     from ..agent_tools import _tool_specs
 
-    specs = _tool_specs(client, include_management, doc_ids, page_images)
+    specs = _tool_specs(client, include_management, doc_ids,
+                        page_images=page_images, collection=collection, seen=seen)
 
     class _ToolServer(MCPServer):
         def __init__(self):
@@ -77,15 +79,9 @@ def build_mcp_server(client, include_management: bool = False, doc_ids=None,
 
 def build_openai_tools(client, include_management: bool = False,
                        hosted: bool = False, doc_ids=None,
-                       page_images: bool = False) -> list:
-    try:
-        from agents import HostedMCPTool
-        from agents.mcp import MCPUtil
-    except ImportError as exc:
-        raise PageIndexAPIError(
-            "as_openai_tools requires the OpenAI Agents SDK — "
-            "pip install openai-agents."
-        ) from exc
+                       page_images: bool = False, collection=None, seen=None) -> list:
+    from agents import HostedMCPTool
+    from agents.mcp import MCPUtil
     if getattr(client, "api_key", None) and hosted:
         # include_management picks the endpoint — the URL itself is the
         # gate (?tools=read serves only readOnlyHint-annotated tools), so
@@ -99,7 +95,7 @@ def build_openai_tools(client, include_management: bool = False,
             "require_approval": "never",
         })]
 
-    server = build_mcp_server(client, include_management, doc_ids,
-                              page_images)
+    server = build_mcp_server(client, include_management, doc_ids, page_images, collection,
+                              seen)
     return [MCPUtil.to_function_tool(tool, server, False)
             for tool in server.tools]

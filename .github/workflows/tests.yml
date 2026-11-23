@@ -35,12 +35,22 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+      # "without" is the default install; "with" adds both optional extras
       - run: pip install -r requirements.txt pytest
-      - if: matrix.agent-frameworks == 'without'
-        # requirements.txt carries it; this leg tests the no-framework paths
-        run: pip uninstall -y openai-agents
       - if: matrix.agent-frameworks == 'with'
-        run: pip install openai-agents claude-agent-sdk anthropic
+        run: pip install claude-agent-sdk anthropic
       - if: matrix.pdfium == '4'
         run: pip install "pypdfium2<5"
       - run: python -m pytest -q
+        env:
+          PAGEINDEX_API_KEY: ${{ secrets.PAGEINDEX_API_KEY }}
+
+  gate:
+    needs: tests
+    # always(), because GitHub counts a SKIPPED required check as
+    # passing: skipping on cancel would green-light a commit with zero
+    # legs run. A cancelled run must go red here, not vanish.
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "${{ needs.tests.result }}" = "success"

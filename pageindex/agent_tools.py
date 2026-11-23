@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import copy
 import difflib
+import html
 import inspect
 import json
 import os
@@ -97,13 +98,19 @@ TOOL_CONTRACT: dict[str, dict[str, Any]] = {
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
         "description": (
             "Primary document retrieval tool. After orienting with "
-            "get_folder_structure() (when available), use this for all "
-            "document-related questions. The bare call returns root-level "
-            "sub-folders and documents; pass folder_id to drill into a "
-            'sub-folder level by level. Use sort="relevance" + query for '
-            "semantic ranking. Do NOT jump to search_documents() first — it "
-            "is an escalation path, only after "
-            'browse_documents(sort="relevance") has failed.'
+            "`get_folder_structure()` (when available) — and, for queries "
+            "that may involve typed attributes, pairing it with "
+            "`get_metadata_schema()` so you know which fields metadata mode "
+            "could filter on — use this for all document-related questions. "
+            "The bare call returns root-level sub-folders and documents; pass "
+            "`folder_id` to drill into a sub-folder level by level. Use "
+            '`sort="relevance"` + `query` for semantic ranking. Do NOT jump '
+            "to `search_documents()` first — keyword search and metadata mode "
+            "are escalation paths, only after "
+            '`browse_documents(sort="relevance")` + the persistence retries '
+            "have failed. `browse_documents` does not filter by attribute — "
+            "for typed-attribute queries, escalate to "
+            '`search_documents(mode="metadata")`.'
         ),
         "schema": {
             "type": "object",
@@ -152,8 +159,8 @@ TOOL_CONTRACT: dict[str, dict[str, Any]] = {
                 "query": {
                     "type": "string",
                     "description": (
-                        "Search query for relevance ranking. Required when "
-                        'sort="relevance"; must be omitted when sort="time".'
+                        "Search query for relevance ranking. "
+                        'Required when sort="relevance".'
                     ),
                 },
                 "offset": {
@@ -184,10 +191,9 @@ TOOL_CONTRACT: dict[str, dict[str, Any]] = {
     "get_document": {
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
         "description": (
-            "Check a document's processing status and metadata. `status` is "
-            'one of "pending", "queued", "processing", "completed", or '
-            '"failed" — call this before `get_document_structure()` or '
-            "`get_page_content()` to confirm the document is ready."
+            "Check a document's processing status and metadata. Call this "
+            "before `get_document_structure()` or `get_page_content()` to "
+            'confirm the document is ready (`status === "completed"`).'
         ),
         "schema": {
             "type": "object",
@@ -950,12 +956,9 @@ def _get_document_structure(client, doc_name: str,
                                 waited and entry.get("status") != "failed")
 
     try:
-        raw_tree = getattr(getattr(client, "_api", None), "raw_tree", None)
-        tree = raw_tree(entry["id"]) if raw_tree is not None else None
-        if tree is None:
-            # _format_structure strips text anyway — don't download it.
-            tree = client.get_tree(entry["id"], node_summary=True,
-                                   include_text=False).get("result")
+        # _format_structure strips text anyway — don't download it.
+        tree = client.get_tree(entry["id"], node_summary=True,
+                               include_text=False).get("result")
     except PageIndexAPIError as exc:
         return _failure(
             f"Failed to retrieve document structure: {exc}",
@@ -1688,11 +1691,89 @@ def _raise_account_limit(blocks: list) -> None:
     raise PageIndexAPIError(message, status_code=status)
 
 
+# The tools whose results attach page pictures, by the field naming those pages.
+_PICTURE_PAGES = {"view_pages": "returned_pages",
+                  "get_page_content": "picture_pages", "zoom_page": "page"}
+_CITE_OPEN_RE = re.compile(r"<cite\s[^<>]*>")
+_TAG_ATTR_RE = re.compile(r"""\b(\w+)\s*=\s*(["'])(.*?)\2""", re.S)
+_BOX_ATTR_RE = re.compile(r"""\s+box\s*=\s*("[^"]*"|'[^']*')""")
+
+
+class _SeenPages:
+    """The pages one chat call's tools pictured; strip() drops boxes elsewhere."""
+
+    def __init__(self):
+        self.pages: set = set()
+
+    def record(self, name: str, blocks: list) -> None:
+        field = _PICTURE_PAGES.get(name)
+        if field is None or not any(isinstance(block, dict)
+                                    and block.get("type") == "image"
+                                    for block in blocks):
+            return
+        try:
+            result = json.loads(blocks[0]["text"])
+            pictured = result[field]
+            pages = ([pictured] if isinstance(pictured, int)
+                     else _expand_pages(pictured))
+        except (LookupError, TypeError, ValueError):
+            return
+        for ref in (result.get("path"), result.get("doc_name")):
+            if isinstance(ref, str) and ref:
+                for doc in (ref, ref.rsplit("/", 1)[-1]):
+                    self.pages.update((doc, page) for page in pages)
+
+    def strip(self, text: str) -> str:
+        return _CITE_OPEN_RE.sub(self._tag, text) if "box" in text else text
+
+    def _tag(self, match: re.Match) -> str:
+        tag = match.group(0)
+        attrs = {name: value for name, _, value in _TAG_ATTR_RE.findall(tag)}
+        try:
+            page = int(attrs.get("page", "").split("-")[0])
+        except ValueError:
+            return tag
+        doc = attrs.get("doc", "").strip()
+        if "box" not in attrs or (doc, page) in self.pages \
+                or (html.unescape(doc), page) in self.pages:
+            return tag
+        return _BOX_ATTR_RE.sub("", tag, count=1)
+
+    def stream(self) -> "_HeldTags":
+        return _HeldTags(self)
+
+
+class _HeldTags:
+    """strip() over a text's pieces: a tag open at a piece's end waits."""
+
+    def __init__(self, seen: _SeenPages):
+        self.seen, self.held = seen, ""
+
+    def feed(self, piece: str) -> str:
+        text = self.held + piece
+        start = text.rfind("<")
+        tail = text[start:] if start >= 0 else ""
+        opening = ">" not in tail and (
+            "<cite".startswith(tail) if len(tail) <= 5
+            else tail.startswith("<cite") and tail[5].isspace())
+        cut = start if start >= 0 and opening else len(text)
+        self.held = text[cut:]
+        return self.seen.strip(text[:cut])
+
+    def flush(self) -> str:
+        """The text's end: a tag never closed goes out as written."""
+        rest, self.held = self.held, ""
+        return rest
+
+
 def _bridge_invoker(bridge, name: str, schema: dict,
+                    collection: Optional[str] = None,
+                    seen: Optional[_SeenPages] = None,
                     ) -> "Callable[[dict], tuple[list, bool]]":
     """One cloud tool call proxied over MCP: string booleans are coerced
     (same as call_tool), None-valued arguments are dropped (None ≡ omitted,
-    matching the contract's "omit if ..." semantics) and failures are
+    matching the contract's "omit if ..." semantics), a tool that takes a
+    ``collection`` is held to the given one, and failures are
     contained in the error envelope — except auth failures, what
     survived the bridge's own retries (401/403/429/5xx), an unreachable
     server and the cloud's RATE_LIMITED / USAGE_LIMIT_REACHED tool errors
@@ -1702,6 +1783,9 @@ def _bridge_invoker(bridge, name: str, schema: dict,
         try:
             arguments = {key: value for key, value in arguments.items()
                          if value is not None}
+            if collection is not None and "collection" in (
+                    schema.get("properties") or {}):
+                arguments["collection"] = collection
             _coerce_bool_args(schema, arguments)
             blocks, is_error = bridge.call_tool(name, arguments)
         except Exception as exc:
@@ -1722,6 +1806,8 @@ def _bridge_invoker(bridge, name: str, schema: dict,
             return [{"type": "text", "text": _dumps(payload)}], True
         if is_error:
             _raise_account_limit(blocks)
+        elif seen is not None:
+            seen.record(name, blocks)
         return blocks, is_error
     return _invoke
 
@@ -1830,30 +1916,43 @@ def _require_doc_selection(doc_ids) -> None:
 
 def _tool_specs(client, include_management: bool = False, doc_ids=None,
                 page_images: bool = False,
+                annotations: Optional[dict] = None,
+                collection: Optional[str] = None,
+                seen: Optional[_SeenPages] = None,
                 ) -> "list[tuple[str, str, dict, Callable[[dict], tuple[list, bool]]]]":
     """(name, description, schema, invoke) per tool, for adapters that take
     the wire schema verbatim. ``invoke`` returns (content blocks, is_error):
     the MCP content as the server sent it, one text block from the local
     tools. Schemas are copies (frameworks keep the dict by reference).
     ``doc_ids`` is the local chat scope, already validated and dropped on
-    cloud by ``_local_doc_scope``. ``page_images`` swaps the local read set
-    for the image-reading variant; the cloud branch ignores it (the live
-    tool set already ships get_document_image)."""
+    cloud by ``_local_doc_scope``. A dict passed as ``annotations``
+    receives each annotated tool's MCP annotations by name: the server's
+    on cloud, the contract's locally. ``collection`` is the cloud chat's
+    collection, by name: every tool that takes one is held to it, and the
+    folder-tree tools are left out. ``seen`` records the pages the cloud
+    tools picture."""
     if getattr(client, "api_key", None):
         bridge = _cloud_bridge(client, gated=not include_management)
         tools_meta = bridge.list_tools()
+        if collection is not None:
+            tools_meta = [meta for meta in tools_meta if meta.get("name") not in
+                          ("browse_documents", "get_folder_structure")]
         if not tools_meta:
             raise PageIndexAPIError(
                 "The MCP server returned no tools — a zero-tool agent would "
                 "answer from the model's own knowledge, not the documents, "
                 "with nothing to signal it."
             )
+        if annotations is not None:
+            annotations.update({str(meta.get("name") or "tool"): meta["annotations"]
+                                for meta in tools_meta if meta.get("annotations")})
         return [(str(meta.get("name") or "tool"),
                  meta.get("description") or "",
                  copy.deepcopy(meta.get("inputSchema"))
                  or {"type": "object", "properties": {}},
                  _bridge_invoker(bridge, str(meta.get("name") or "tool"),
-                                 meta.get("inputSchema") or {}))
+                                 meta.get("inputSchema") or {}, collection,
+                                 seen))
                 for meta in tools_meta]
 
     def local_invoke(name: str) -> "Callable[[dict], tuple[list, bool]]":
@@ -1870,6 +1969,10 @@ def _tool_specs(client, include_management: bool = False, doc_ids=None,
     def page_image_invoke(arguments: dict) -> tuple[list, bool]:
         return _get_document_image_blocks(client, arguments, doc_ids=doc_ids)
 
+    if annotations is not None:
+        annotations.update({name: TOOL_CONTRACT[name]["annotations"]
+                            for name in tool_names(include_management)
+                            if TOOL_CONTRACT[name].get("annotations")})
     return [(name, _local_description(name), _local_schema(name),
              page_image_invoke if name == "get_document_image"
              else local_invoke(name))
@@ -1899,9 +2002,8 @@ def build_agent_tools(client, include_management: bool = False,
 # ── agent instructions ──
 
 _INSTRUCTIONS_HEADER = (
-    "PageIndex by Vectify AI is a document platform for uploading and "
-    "managing long PDFs (research papers, financial reports, legal docs, "
-    "textbooks, etc.)."
+    "PageIndex by Vectify AI manages the user's long PDFs (research papers, "
+    "financial reports, legal docs, textbooks, etc.)."
 )
 
 _READING_WORKFLOW = f"""\
@@ -1931,12 +2033,11 @@ DECISION:
 
 _AFTER_DISCOVERY = """\
 - Skip discovery ONLY for questions with NO possible document connection (e.g., "capital of France").
-- After discovery: 1 match or 1 clearly best match → proceed to read and answer without asking. Multiple equally relevant → ask user to pick.
-- Results returned ≠ correct results. If the returned documents do not clearly match the user's intent (e.g., wrong topic, wrong time period, wrong document type), treat it the same as "not found" and continue the PERSISTENCE protocol below."""
+- After discovery: 1 match or 1 clearly best match → proceed to read and answer without asking. Multiple equally relevant → ask user to pick."""
 
 _PERSISTENCE = """\
 PERSISTENCE (before concluding the target document is not in the library):
-This protocol applies both when results are empty AND when results are returned but none match the user's intent. Do NOT give up after a single discovery attempt. Follow these steps in order:
+Applies both when results are empty AND when returned results do not clearly match the user's intent (wrong topic, time period, or document type) — treat a mismatch as "not found". Do NOT give up after a single discovery attempt. Follow these steps in order:
 1. browse_documents() and compare every returned name/description against the user's intent
 2. Rephrase the query with synonyms or alternative terms and browse again
 3. Page through the ENTIRE library with `limit: 50` and `offset: next_offset` until has_more is false — MANDATORY, must be completed before concluding "not found"
@@ -1984,33 +2085,26 @@ CITATIONS
 - When page content includes block_id values, citations MUST be block-level: copy the exact block_id of the supporting block. Page-only cites are allowed ONLY when the tool output carries no block_id (legacy documents, structure outlines). NEVER invent or alter block_id values.
 - For a claim drawn from multiple blocks on one page, add one tag per supporting block (at most 3); beyond that, cite the single strongest block.
 - Each tag must reference a SINGLE page integer. For multi-page citations, use separate tags.""",
-    "footnote": """\
-GROUNDING
-- Answer only from the user's PageIndex documents. Call get_page_content() and state only what was actually read there.
-- Never fill a gap from general knowledge. When the documents do not answer the question, say so.
-
-CITATIONS
-- Cite only statements supported by tool outputs, as a Markdown footnote: put [^n] immediately after the claim and define it at the end of the answer as [^n]: {docName}, p. {pageNumber} or [^n]: {docName}, p. {pageNumber}, block {blockId}.
-- When page content includes block_id values, citations MUST be block-level: copy the exact block_id of the supporting block. Page-only cites are allowed ONLY when the tool output carries no block_id (legacy documents, structure outlines). NEVER invent or alter block_id values.
-- For a claim drawn from multiple blocks on one page, add one footnote per supporting block (at most 3); beyond that, cite the single strongest block.
-- Each footnote must reference a SINGLE page integer. For multi-page citations, use separate footnotes.
-- Number footnotes from 1 in order of first use; reuse a number when the same page and block support another claim. Every marker needs a definition and every definition a marker.""",
 }
 
 
 def fetch_citation_prompt(client, format: str) -> str:
     """The MCP server's ``cited_answer`` prompt as system-prompt text;
-    ``format`` rides as its one argument. Local: the frozen copy,
-    page-level."""
-    if not getattr(client, "api_key", None):
-        try:
-            return LOCAL_CITATION_PROMPTS[format]
-        except KeyError:
-            raise PageIndexAPIError(
-                f"citations format {format!r} is not one of "
-                f"{', '.join(LOCAL_CITATION_PROMPTS)}.") from None
-    _, messages = _cloud_bridge(client, gated=True).get_prompt(
-        "cited_answer", {"format": format})
+    ``format`` rides as its one argument: a frozen format, or another the
+    server completes. Local: the frozen copy, page-level."""
+    known = list(LOCAL_CITATION_PROMPTS)
+    bridge = None
+    if getattr(client, "api_key", None):
+        bridge = _cloud_bridge(client, gated=True)
+        if format not in known:
+            known = (bridge.prompt_argument_values("cited_answer", "format")
+                     or known)
+    if format not in known:
+        raise PageIndexAPIError(
+            f"citations format {format!r} is not one of {', '.join(known)}.")
+    if bridge is None:
+        return LOCAL_CITATION_PROMPTS[format]
+    _, messages = bridge.get_prompt("cited_answer", {"format": format})
     text = render_prompt_text(messages)
     if not text.strip():
         raise PageIndexAPIError(
@@ -2127,10 +2221,48 @@ def folder_targeting_block(client, folder_id) -> Optional[str]:
     )
 
 
-def targeting_block(client, doc_id, folder_id=None) -> Optional[str]:
-    """The chat lanes' leading user message: the folder block, then the
-    document block, joined as the managed chat joins them; None when
-    there is nothing to place."""
-    blocks = [folder_targeting_block(client, folder_id),
+def collection_targeting_block(client, collection_id,
+                               ) -> tuple[Optional[str], Optional[str]]:
+    """The collection_id targeting text, in the folder block's shape, and
+    the collection's name, which the tools address it by. Cloud-only."""
+    if collection_id is None:
+        return None, None
+    if not isinstance(collection_id, str) or not collection_id:
+        raise PageIndexAPIError("collection_id must be a non-empty string.")
+    if not getattr(client, "api_key", None):
+        raise PageIndexAPIError(
+            "collection_id is cloud-only — collections are not supported in "
+            "local mode. Create the client with an api_key to use them.")
+    collections = client.list_collections().get("collections") or []
+    collection = next(
+        (c for c in collections if c.get("id") == collection_id), None)
+    if collection is None:
+        raise PageIndexAPIError(
+            f"Collection not found or access denied: {collection_id}")
+    metadata = {key: collection[key] for key in ("id", "name", "description")
+                if collection.get(key)}
+    name = json.dumps(collection.get("name"), ensure_ascii=False)
+    return (
+        f"The user has specified collection: {collection.get('name')}\n"
+        f"Collection metadata: {json.dumps(metadata, ensure_ascii=False)}\n"
+        f"Discover its documents with list_documents(collection={name}) "
+        f"or search_documents(questions, collection={name})."
+    ), collection.get("name")
+
+
+def targeting_block(client, doc_id, folder_id=None, collection_id=None,
+                    ) -> tuple[Optional[str], Optional[str]]:
+    """The chat lanes' leading user message: the folder or collection
+    block, then the document block, joined as the managed chat joins them,
+    None when there is nothing to place; and the collection's name, for
+    the tools to be held to."""
+    if collection_id is not None and (
+            doc_id is not None or folder_id not in (None, "", "root")):
+        raise PageIndexAPIError(
+            "collection_id scopes the chat to one collection — pass it "
+            "without doc_id and folder_id.")
+    collection_block, collection = collection_targeting_block(
+        client, collection_id)
+    blocks = [folder_targeting_block(client, folder_id), collection_block,
               doc_targeting_block(client, doc_id)]
-    return "\n\n".join(block for block in blocks if block) or None
+    return "\n\n".join(block for block in blocks if block) or None, collection

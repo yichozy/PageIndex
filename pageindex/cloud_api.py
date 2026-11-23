@@ -1,10 +1,15 @@
-"""Cloud mode of the PageIndex SDK, based on the 0.2.8 client."""
+"""Cloud mode of the PageIndex SDK: the client of the PageIndex Cloud API."""
+import os
 import requests
-from typing import Optional, Dict, Any, List, Union, Iterator
+from pathlib import Path
+from typing import Optional, Dict, Any, List, Sequence, Union, Iterator
 import json
 import urllib.parse
 
+from .chat_stream import ChatObject
 from .errors import PageIndexAPIError
+from .naming import sanitize_filename, validate_folder_name
+from .retry import cloud_session
 
 
 def _enc(value: str) -> str:
@@ -19,6 +24,14 @@ class CloudAPI:
 
     def __init__(self, client):
         self._client = client
+        self._session, self._pid = cloud_session(), os.getpid()
+
+    @property
+    def _http(self):
+        # a forked process would read replies off the sockets its parent pooled
+        if self._pid != os.getpid():
+            self._session, self._pid = cloud_session(), os.getpid()
+        return self._session
 
     @property
     def BASE_URL(self) -> str:
@@ -40,48 +53,78 @@ class CloudAPI:
         beta_headers: Optional[List[str]] = None,
         folder_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        collection_id: Optional[str] = None,
+        index: bool = True,
+        extract: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Upload a PDF document for processing. The system will automatically process both tree generation and OCR.
+        Upload a PDF document for processing; the tree is built in the background,
+        or not at all with ``index=False``.
         Immediately returns a document identifier (`doc_id`) for subsequent operations.
 
         Args:
             file_path (str): Path to the PDF file.
-            mode (str, optional): Processing mode (e.g., "mcp"). Defaults to None.
+            mode (str, optional): None (default), the default cloud pipeline, or "flash".
             beta_headers (List[str], optional): Beta feature headers (e.g., ["block_reference"]
                 to enable block-level content with bounding boxes). Defaults to None.
             folder_id (str, optional): Folder (workspace) ID to assign the document to. Defaults to None.
             metadata (dict, optional): Your own JSON-serializable tags for the document;
                 returned in get_tree/get_ocr responses and list_documents entries. Defaults to None.
+            collection_id (str, optional): Collection ID to store the document in, in place of a folder. Defaults to None.
+            extract (dict, optional): With ``index=False``, an extract job's
+                configuration, as ``create_extract()`` takes it: the job
+                starts on the document, and only its extraction is charged,
+                once it completes. A job that does not complete leaves the
+                document this upload made failed, with its name and file but
+                no pages, until you delete it.
 
         Returns:
             dict: {'doc_id': ...} — plus 'name', the stored document name
                 (a taken name gains a numeric suffix), when the server
-                returns it.
+                returns it, and with ``extract`` 'extract_job_id'. A file
+                stored already whose pages are not ready starts no job:
+                {'doc_id', 'duplicate': True}.
         """
         if mode == "toc":
+            raise PageIndexAPIError("Failed to submit document: mode='toc' is local-only.")
+        if mode not in (None, "flash"):
             raise PageIndexAPIError(
-                "Failed to submit document: mode='toc' is local-only; the "
-                "cloud API does not build trees from PDF bookmark outlines."
+                f"Failed to submit document: unknown cloud processing mode {mode!r}. "
+                "Cloud supports only 'flash'."
             )
         data: Dict[str, Any] = {'if_retrieval': True}
-        if mode is not None:
-            data['mode'] = mode
+        if mode == "flash":
+            # The server rejects if_retrieval alongside algorithm=flash, and
+            # keeps node text for Flash trees by default.
+            data = {'algorithm': 'flash'}
+        if not index:
+            data = {'algorithm': 'none'}
         if beta_headers is not None:
             data['beta_headers'] = json.dumps(beta_headers)
         if folder_id is not None:
             data['folder_id'] = folder_id
         if metadata is not None:
             data['metadata'] = json.dumps(metadata)
+        if collection_id is not None:
+            data['collection_id'] = collection_id
+        if extract is not None:
+            data['extract'] = json.dumps(extract)
 
         with open(file_path, "rb") as f:
-            response = requests.post(
+            response = self._http.post(
                 f"{self.BASE_URL}/doc/",
                 headers=self._headers(),
-                files={'file': f},
+                files={'file': (sanitize_filename(Path(file_path).name), f)},
                 data=data
             )
 
+        if response.status_code == 409 and extract is not None:
+            try:
+                stored = response.json()["detail"]["doc_id"]
+            except (ValueError, KeyError, TypeError):
+                stored = None
+            if stored:
+                return {"doc_id": stored, "duplicate": True}
         if response.status_code != 200:
             raise PageIndexAPIError(
                 f"Failed to submit document: {response.text}",
@@ -104,7 +147,7 @@ class CloudAPI:
         if format not in ["page", "node", "raw"]:
             raise ValueError("Format parameter must be 'page', 'node', or 'raw'")
 
-        response = requests.get(
+        response = self._http.get(
             f"{self.BASE_URL}/doc/{_enc(doc_id)}/?type=ocr&format={format}",
             headers=self._headers(),
             timeout=30
@@ -131,7 +174,7 @@ class CloudAPI:
                 height (0-1000), origin top-left. A 404 means the
                 document has no such block.
         """
-        response = requests.get(
+        response = self._http.get(
             f"{self.BASE_URL}/doc/{_enc(doc_id)}/block/{_enc(block_id)}/",
             headers=self._headers(),
             timeout=30
@@ -141,6 +184,84 @@ class CloudAPI:
                 f"Failed to get block: {response.text}",
                 status_code=response.status_code)
         return response.json()
+
+    def get_page_image(self, doc_id: str, page: int) -> str:
+        """Presigned URL for a rendered page image.
+
+        Args:
+            doc_id (str): Document ID.
+            page (int): 1-based page number.
+
+        Returns:
+            str: A presigned URL to the page image (JPEG).
+        """
+        response = self._http.get(
+            f"{self.BASE_URL}/doc/s3/{_enc(doc_id)}/images",
+            headers=self._headers(),
+            params={"start": page, "end": page},
+            timeout=30
+        )
+        if response.status_code != 200:
+            raise PageIndexAPIError(
+                f"Failed to get page image: {response.text}",
+                status_code=response.status_code)
+        for img in response.json().get("images") or []:
+            if img.get("page") == page and img.get("url"):
+                return img["url"]
+        raise PageIndexAPIError(f"No image URL returned for page {page}.")
+
+    def page_image(self, doc_id: str, page: int, box: Optional[Sequence[float]] = None) -> bytes:
+        """A rendered page as JPEG bytes.
+
+        Args:
+            doc_id (str): Document ID.
+            page (int): 1-based page number.
+            box (sequence of 4 floats, optional): (x0, y0, x1, y1) as fractions
+                of the page from its top left: only that part, drawn sharper.
+
+        Returns:
+            bytes: The JPEG.
+        """
+        if box is None:
+            # a presigned URL: the API key stays off it
+            response = self._http.get(self.get_page_image(doc_id, page), timeout=60)
+        else:
+            response = self._http.get(
+                f"{self.BASE_URL}/doc/s3/{_enc(doc_id)}/images/region",
+                headers=self._headers(),
+                params={"page": page, "box": ",".join(str(v) for v in box)},
+                timeout=60
+            )
+        if response.status_code != 200:
+            raise PageIndexAPIError(
+                f"Failed to get page image: {response.text}",
+                status_code=response.status_code)
+        return response.content
+
+    def get_document_image(self, doc_id: str, img_id: str) -> str:
+        """Presigned URL for an embedded image extracted during OCR.
+
+        Args:
+            doc_id (str): Document ID.
+            img_id (str): Image ID as page content carries it,
+                e.g. ``"img-7.jpeg"``.
+
+        Returns:
+            str: A presigned URL to the image.
+        """
+        response = self._http.get(
+            f"{self.BASE_URL}/doc/{_enc(doc_id)}/image/{_enc(img_id)}/",
+            headers=self._headers(),
+            timeout=30
+        )
+        if response.status_code != 200:
+            raise PageIndexAPIError(
+                f"Failed to get document image: {response.text}",
+                status_code=response.status_code)
+        url = response.json().get("url")
+        if not url:
+            raise PageIndexAPIError(f"No image URL returned for {img_id!r}.")
+        return url
 
     # ---------- TREE GENERATION ----------
 
@@ -156,7 +277,7 @@ class CloudAPI:
         Returns:
             dict: API response with status and, if ready, tree structure.
         """
-        response = requests.get(
+        response = self._http.get(
             f"{self.BASE_URL}/doc/{_enc(doc_id)}/?type=tree&summary={node_summary}"
             f"&include_text={str(include_text).lower()}",
             headers=self._headers(),
@@ -165,6 +286,24 @@ class CloudAPI:
         if response.status_code != 200:
             raise PageIndexAPIError(
                 f"Failed to get tree result: {response.text}",
+                status_code=response.status_code)
+        return response.json()
+
+    def build_outline_index(self, doc_id: str) -> Dict[str, Any]:
+        """
+        Build the tree of a document stored without one.
+
+        Returns:
+            dict: {'doc_id', 'index_status'}.
+        """
+        response = self._http.post(
+            f"{self.BASE_URL}/doc/{_enc(doc_id)}/index",
+            headers=self._headers(),
+            timeout=30
+        )
+        if response.status_code != 200:
+            raise PageIndexAPIError(
+                f"Failed to build index: {response.text}",
                 status_code=response.status_code)
         return response.json()
 
@@ -187,7 +326,7 @@ class CloudAPI:
             "query": query,
             "thinking": thinking
         }
-        response = requests.post(
+        response = self._http.post(
             f"{self.BASE_URL}/retrieval/",
             headers=self._headers(),
             json=payload,
@@ -209,7 +348,7 @@ class CloudAPI:
         Returns:
             dict: Retrieval status and results.
         """
-        response = requests.get(
+        response = self._http.get(
             f"{self.BASE_URL}/retrieval/{_enc(retrieval_id)}/",
             headers=self._headers(),
             timeout=30
@@ -232,14 +371,14 @@ class CloudAPI:
         enable_citations: bool = False,
         extra_body: Optional[Dict[str, Any]] = None,
         folder_id: Optional[str] = None,
-    ) -> Union[Dict[str, Any], Iterator[str], Iterator[Dict[str, Any]]]:
+    ) -> Union[ChatObject, Iterator[str], Iterator[ChatObject]]:
         """
-        PageIndex Chat Completions. Optionally scoped to specific PageIndex documents.
+        PageIndex Chat Completions. Optionally targeted at specific PageIndex documents.
 
         Args:
             messages (List[Dict[str, str]]): Conversation messages with 'role' and 'content' keys.
             stream (bool, optional): Enable streaming responses. Default is False.
-            doc_id (Optional[Union[str, List[str]]], optional): Document ID(s) to scope the conversation. Can be a single ID or a list of IDs.
+            doc_id (Optional[Union[str, List[str]]], optional): Document ID(s) the conversation targets, in its prompt only: the chat's tools reach every document the api_key can. Can be a single ID or a list of IDs.
             temperature (Optional[float], optional): Sampling temperature. Default is None (uses API default).
             stream_metadata (bool, optional): If True and stream=True, return raw chunks with metadata instead of just text. Default is False.
             enable_citations (bool, optional): Enable citation instructions in responses. Default is False.
@@ -247,10 +386,12 @@ class CloudAPI:
             folder_id (Optional[str], optional): Folder ID to steer discovery toward one folder; "root" means the whole library.
 
         Returns:
-            Union[Dict[str, Any], Iterator[str], Iterator[Dict[str, Any]]]:
+            Union[ChatObject, Iterator[str], Iterator[ChatObject]]:
                 - If stream=False: Complete response dictionary
                 - If stream=True and stream_metadata=False: Iterator of text content chunks
                 - If stream=True and stream_metadata=True: Iterator of raw response chunks with metadata
+            Each ChatObject is the response dict, which also reads by
+            attribute as the openai SDK's ChatCompletion / ChatCompletionChunk.
         """
         payload = {
             "messages": messages,
@@ -271,7 +412,7 @@ class CloudAPI:
 
         payload.update(extra_body or {})
 
-        response = requests.post(
+        response = self._http.post(
             f"{self.BASE_URL}/chat/completions/",
             headers=self._headers(),
             json=payload,
@@ -288,46 +429,17 @@ class CloudAPI:
             if stream_metadata:
                 return self._stream_chat_response_raw(response)
             else:
-                return self._stream_chat_response(response)
+                from .local_chat import _text_only
+                return _text_only(self._stream_chat_response_raw(response))
         else:
-            return response.json()
+            from .local_chat import _ChatCompletion
+            body = response.json()
+            # a body that isn't an object keeps reaching chat()'s own check
+            return _ChatCompletion(body) if isinstance(body, dict) else body
 
-    def _stream_chat_response(self, response: requests.Response) -> Iterator[str]:
-        """
-        Parse streaming chat completion response.
-
-        Args:
-            response: Streaming HTTP response
-
-        Yields:
-            str: Content chunks from the streaming response
-        """
-        try:
-            for line in response.iter_lines():
-                if line:
-                    line = line.decode('utf-8')
-                    if line.startswith('data: '):
-                        data = line[6:]
-                        if data == '[DONE]':
-                            break
-
-                        try:
-                            chunk = json.loads(data)
-                            if chunk.get("error"):
-                                raise PageIndexAPIError(
-                                    "Chat completion failed mid-stream: "
-                                    f"{chunk['error']}")
-                            choices = chunk.get("choices") or [{}]
-                            content = choices[0].get("delta", {}).get("content", "")
-                            if content:
-                                yield content
-                        except json.JSONDecodeError:
-                            continue
-        finally:
-            response.close()
-
-    def _stream_chat_response_raw(self, response: requests.Response) -> Iterator[Dict[str, Any]]:
+    def _stream_chat_response_raw(self, response: requests.Response) -> Iterator[ChatObject]:
         """Streaming chat completion with full metadata, including citation events."""
+        from .local_chat import _ChatCompletionChunk
         try:
             for line in response.iter_lines():
                 if line:
@@ -343,7 +455,7 @@ class CloudAPI:
                                 raise PageIndexAPIError(
                                     "Chat completion failed mid-stream: "
                                     f"{chunk['error']}")
-                            yield chunk
+                            yield _ChatCompletionChunk(chunk)
                         except json.JSONDecodeError:
                             continue
         finally:
@@ -369,7 +481,7 @@ class CloudAPI:
                 - folderId (str | None): Containing folder ID
                 - metadata (dict | None): Your own tags from submit_document
         """
-        response = requests.get(
+        response = self._http.get(
             f"{self.BASE_URL}/doc/{_enc(doc_id)}/metadata/",
             headers=self._headers(),
             timeout=30
@@ -377,6 +489,29 @@ class CloudAPI:
         if response.status_code != 200:
             raise PageIndexAPIError(
                 f"Failed to get document metadata: {response.text}",
+                status_code=response.status_code)
+        return response.json()
+
+    def set_document_metadata(self, doc_id: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Replace a document's metadata (your own tags) with `metadata`.
+
+        Args:
+            doc_id (str): Document ID.
+            metadata (dict): The whole of the new metadata; {} clears it.
+
+        Returns:
+            dict: {"doc_id": ..., "metadata": ...}
+        """
+        response = self._http.put(
+            f"{self.BASE_URL}/doc/{_enc(doc_id)}/metadata/",
+            headers=self._headers(),
+            json=metadata,
+            timeout=30
+        )
+        if response.status_code != 200:
+            raise PageIndexAPIError(
+                f"Failed to update document metadata: {response.text}",
                 status_code=response.status_code)
         return response.json()
 
@@ -390,7 +525,7 @@ class CloudAPI:
         Returns:
             dict: API response.
         """
-        response = requests.delete(
+        response = self._http.delete(
             f"{self.BASE_URL}/doc/{_enc(doc_id)}/",
             headers=self._headers(),
             timeout=30
@@ -401,15 +536,19 @@ class CloudAPI:
                 status_code=response.status_code)
         return response.json() if response.content else {}
 
-    def list_documents(self, limit: int = 50, offset: int = 0, folder_id: Optional[str] = None, name: Optional[str] = None) -> Dict[str, Any]:
+    def list_documents(self, limit: int = 50, offset: int = 0, folder_id: Optional[str] = None, name: Optional[str] = None, recursive: bool = False, collection_id: Optional[str] = None, metadata_filter: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         List all documents for the authenticated user with pagination.
 
         Args:
-            limit (int, optional): Maximum number of documents to return (1-100). Defaults to 50.
+            limit (int, optional): Maximum number of documents to return (1-10000). Defaults to 50.
             offset (int, optional): Number of documents to skip. Defaults to 0.
             folder_id (str, optional): Filter by folder (workspace) ID. If provided, only documents
                 in the specified folder are returned. Defaults to None (all documents).
+            recursive (bool, optional): Also return documents in descendant folders of folder_id.
+                Defaults to False (direct contents only).
+            collection_id (str, optional): Return one collection's documents. Defaults to None.
+            metadata_filter (dict, optional): Return only the documents whose metadata meets it. Defaults to None.
 
         Returns:
             dict: API response containing:
@@ -418,8 +557,8 @@ class CloudAPI:
                 - limit (int): Applied limit
                 - offset (int): Applied offset
         """
-        if limit < 1 or limit > 100:
-            raise ValueError("limit must be between 1 and 100")
+        if limit < 1 or limit > 10000:
+            raise ValueError("limit must be between 1 and 10000")
         if offset < 0:
             raise ValueError("offset must be non-negative")
 
@@ -428,8 +567,14 @@ class CloudAPI:
             params["folder_id"] = folder_id
         if name is not None:
             params["name"] = name
+        if recursive:
+            params["recursive"] = recursive
+        if collection_id is not None:
+            params["collection_id"] = collection_id
+        if metadata_filter is not None:
+            params["metadata_filter"] = json.dumps(metadata_filter)
 
-        response = requests.get(
+        response = self._http.get(
             f"{self.BASE_URL}/docs/",
             headers=self._headers(),
             params=params,
@@ -462,13 +607,17 @@ class CloudAPI:
                 - folder (dict): Folder info with id, name, description, parent_folder_id,
                     created_at, file_count, children_count
         """
+        try:
+            validate_folder_name(name)
+        except ValueError as exc:
+            raise PageIndexAPIError(str(exc)) from exc
         payload = {"name": name}
         if description is not None:
             payload["description"] = description
         if parent_folder_id is not None:
             payload["parent_folder_id"] = parent_folder_id
 
-        response = requests.post(
+        response = self._http.post(
             f"{self.BASE_URL}/folder/",
             headers=self._headers(),
             json=payload,
@@ -497,7 +646,7 @@ class CloudAPI:
         if parent_folder_id is not None:
             params["parent_folder_id"] = parent_folder_id
 
-        response = requests.get(
+        response = self._http.get(
             f"{self.BASE_URL}/folders/",
             headers=self._headers(),
             params=params,
@@ -506,5 +655,361 @@ class CloudAPI:
         if response.status_code != 200:
             raise PageIndexAPIError(
                 f"Failed to list folders: {response.text}",
+                status_code=response.status_code)
+        return response.json()
+
+    # ---------- COLLECTION MANAGEMENT ----------
+
+    def create_collection(self, name: str, description: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Create a new, empty collection.
+
+        Args:
+            name (str): Collection name, unique among your collections.
+            description (str, optional): Collection description. Defaults to None.
+
+        Returns:
+            dict: {"collection": {"id", "name", "description"}}
+        """
+        payload = {"name": name}
+        if description is not None:
+            payload["description"] = description
+
+        response = self._http.post(
+            f"{self.BASE_URL}/collection/",
+            headers=self._headers(),
+            json=payload,
+            timeout=30
+        )
+        if response.status_code != 200:
+            raise PageIndexAPIError(
+                f"Failed to create collection: {response.text}",
+                status_code=response.status_code)
+        return response.json()
+
+    def list_collections(self) -> Dict[str, Any]:
+        """
+        List collections, newest first.
+
+        Returns:
+            dict: API response containing:
+                - collections (List[Dict]): Each with id, name, description,
+                    metadata_schema, created_at, document_count
+                - total (int): Total number of collections
+        """
+        response = self._http.get(
+            f"{self.BASE_URL}/collections/",
+            headers=self._headers(),
+            timeout=30
+        )
+        if response.status_code != 200:
+            raise PageIndexAPIError(
+                f"Failed to list collections: {response.text}",
+                status_code=response.status_code)
+        return response.json()
+
+    def delete_collection(self, collection_id: str) -> Dict[str, Any]:
+        """
+        Delete a collection and every document in it.
+
+        Args:
+            collection_id (str): Collection ID.
+
+        Returns:
+            dict: {"collection_id": ..., "deleted": True, "deleted_documents": ...}
+        """
+        response = self._http.delete(
+            f"{self.BASE_URL}/collection/{_enc(collection_id)}/",
+            headers=self._headers(),
+            timeout=600
+        )
+        if response.status_code != 200:
+            raise PageIndexAPIError(
+                f"Failed to delete collection: {response.text}",
+                status_code=response.status_code)
+        return response.json()
+
+    # ---------- METADATA SCHEMAS ----------
+
+    def _schema_url(self, folder_id: Optional[str], collection_id: Optional[str]) -> str:
+        if folder_id is not None and collection_id is None:
+            owner = f"folder/{_enc(folder_id)}"
+        elif collection_id is not None and folder_id is None:
+            owner = f"collection/{_enc(collection_id)}"
+        else:
+            raise PageIndexAPIError(
+                "A metadata schema belongs to a folder or to a collection: "
+                "pass exactly one of folder_id and collection_id.")
+        return f"{self.BASE_URL}/{owner}/metadata/schema/"
+
+    def create_metadata_schema(
+        self,
+        folder_id: Optional[str] = None,
+        fields: Optional[Dict[str, Any]] = None,
+        collection_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Declare the metadata fields of a top-level folder (workspace) or of a collection.
+
+        Args:
+            folder_id (str, optional): Top-level folder ID, or "root" for the account-level
+                schema used where a top-level folder declares none.
+            fields (dict): Field name to spec, e.g.
+                {"year": {"type": "number", "description": "Fiscal year"}};
+                type is "string", "number" or "boolean".
+            collection_id (str, optional): Collection ID, in place of folder_id.
+
+        Returns:
+            dict: Created schema containing:
+                - folder_id (str) or collection_id (str): The ID passed
+                - schema (dict): {"fields": ...} as stored
+        """
+        if fields is None:
+            raise PageIndexAPIError(
+                "Failed to create metadata schema: fields is required.")
+        response = self._http.put(
+            self._schema_url(folder_id, collection_id),
+            headers=self._headers(),
+            json={"fields": fields},
+            timeout=30
+        )
+        if response.status_code != 200:
+            raise PageIndexAPIError(
+                f"Failed to create metadata schema: {response.text}",
+                status_code=response.status_code)
+        return response.json()
+
+    def get_metadata_schema(
+        self,
+        folder_id: Optional[str] = None,
+        collection_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Get the metadata fields that apply to a folder's or a collection's documents.
+
+        Args:
+            folder_id (str, optional): Any folder ID, or "root" for the account-level
+                schema.
+            collection_id (str, optional): Collection ID, in place of folder_id.
+
+        Returns:
+            dict: Effective schema containing:
+                - folder_id (str) or collection_id (str): The ID passed
+                - workspace_id (str): The folder's top-level folder, or
+                  "root" (folders only)
+                - inherited (bool): True when the schema comes from a
+                  parent folder or the account (folders only)
+                - schema (dict | None): {"fields": ...}, or None when no
+                  schema is declared
+        """
+        response = self._http.get(
+            self._schema_url(folder_id, collection_id),
+            headers=self._headers(),
+            timeout=30
+        )
+        if response.status_code != 200:
+            raise PageIndexAPIError(
+                f"Failed to get metadata schema: {response.text}",
+                status_code=response.status_code)
+        return response.json()
+
+    def delete_metadata_schema(
+        self,
+        folder_id: Optional[str] = None,
+        collection_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Delete the metadata fields declared on a top-level folder
+        (workspace), on the account with folder_id "root", or on a
+        collection. Documents keep their metadata.
+
+        Args:
+            folder_id (str, optional): Top-level folder ID, or "root".
+            collection_id (str, optional): Collection ID, in place of folder_id.
+
+        Returns:
+            dict: {"folder_id" or "collection_id": ..., "deleted": True}
+        """
+        response = self._http.delete(
+            self._schema_url(folder_id, collection_id),
+            headers=self._headers(),
+            timeout=30
+        )
+        if response.status_code != 200:
+            raise PageIndexAPIError(
+                f"Failed to delete metadata schema: {response.text}",
+                status_code=response.status_code)
+        return response.json()
+
+    # ---------- SEARCH ----------
+
+    def search_pages(
+        self,
+        doc_id: str,
+        questions: List[str],
+        top_k: Optional[int] = None,
+        include_text: bool = False,
+        start_page: Optional[int] = None,
+        end_page: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Judge each page of a document on how likely it helps answer each question.
+
+        Returns:
+            dict: {"id", "doc_id", "results": [{"question", "pages", "more_pages"}],
+                "failed_pages", "usage", "seconds"}
+        """
+        payload = {"questions": questions, "top_k": top_k, "include_text": include_text,
+                   "start_page": start_page, "end_page": end_page}
+        response = self._http.post(
+            f"{self.BASE_URL}/doc/{_enc(doc_id)}/page-search/",
+            headers=self._headers(),
+            json={k: v for k, v in payload.items() if v is not None},
+            timeout=300
+        )
+        if response.status_code != 200:
+            raise PageIndexAPIError(
+                f"Failed to search pages: {response.text}",
+                status_code=response.status_code)
+        return response.json()
+
+    def search_documents(
+        self,
+        questions: List[str],
+        document_ids: Optional[List[str]] = None,
+        collection_id: Optional[str] = None,
+        folder_id: Optional[str] = None,
+        recursive: bool = False,
+        metadata_filter: Optional[Dict[str, Any]] = None,
+        top_k: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Judge each document in scope on how likely it holds what answers each question.
+
+        Returns:
+            dict: {"id", "results": [{"question", "documents", "more_documents"}],
+                "failed_documents", "processing_documents", "usage", "seconds"}
+        """
+        payload = {"questions": questions, "document_ids": document_ids,
+                   "collection_id": collection_id, "folder_id": folder_id,
+                   "recursive": recursive, "metadata_filter": metadata_filter, "top_k": top_k}
+        response = self._http.post(
+            f"{self.BASE_URL}/docs/search/",
+            headers=self._headers(),
+            json={k: v for k, v in payload.items() if v is not None},
+            timeout=300
+        )
+        if response.status_code != 200:
+            raise PageIndexAPIError(
+                f"Failed to search documents: {response.text}",
+                status_code=response.status_code)
+        return response.json()
+
+    # ---------- EXTRACT ----------
+
+    def create_extract(
+        self,
+        configuration: Dict[str, Any],
+        doc_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Start an extract job on an uploaded document.
+
+        Args:
+            configuration (dict): {"data_schema", "tier", "cite_sources",
+                "target_pages", "system_prompt"}.
+            doc_id (str): Document ID.
+
+        Returns:
+            dict: The job, pending: {"id", "status", "doc_id", "configuration",
+                "created_at", "updated_at"}
+        """
+        response = self._http.post(
+            f"{self.BASE_URL}/extract/",
+            headers=self._headers(),
+            data={"configuration": json.dumps(configuration), "doc_id": doc_id},
+            timeout=60
+        )
+        if response.status_code != 202:
+            raise PageIndexAPIError(
+                f"Failed to start extract job: {response.text}",
+                status_code=response.status_code)
+        return response.json()
+
+    def get_extract(self, job_id: str) -> Dict[str, Any]:
+        """
+        Get an extract job, with its result once completed.
+
+        Returns:
+            dict: {"id", "status", "doc_id", "configuration", "created_at",
+                "updated_at"}; completed: "extract_result", "extract_metadata"
+                and "usage" too; failed: "error_message" too.
+        """
+        response = self._http.get(
+            f"{self.BASE_URL}/extract/{_enc(job_id)}/",
+            headers=self._headers(),
+            timeout=60
+        )
+        if response.status_code != 200:
+            raise PageIndexAPIError(
+                f"Failed to get extract job: {response.text}",
+                status_code=response.status_code)
+        return response.json()
+
+    def list_extracts(self, limit: int = 20, after: Optional[str] = None) -> Dict[str, Any]:
+        """
+        List extract jobs, newest first, without their results.
+
+        Returns:
+            dict: {"jobs": [...], "next": the id to pass as after, or None}
+        """
+        params: Dict[str, Any] = {"limit": limit}
+        if after is not None:
+            params["after"] = after
+        response = self._http.get(
+            f"{self.BASE_URL}/extracts/",
+            headers=self._headers(),
+            params=params,
+            timeout=30
+        )
+        if response.status_code != 200:
+            raise PageIndexAPIError(
+                f"Failed to list extract jobs: {response.text}",
+                status_code=response.status_code)
+        return response.json()
+
+    def cancel_extract(self, job_id: str) -> Dict[str, Any]:
+        """
+        Stop an extract job that is pending or running.
+
+        Returns:
+            dict: The job, cancelled.
+        """
+        response = self._http.post(
+            f"{self.BASE_URL}/extract/{_enc(job_id)}/cancel/",
+            headers=self._headers(),
+            timeout=30
+        )
+        if response.status_code != 200:
+            raise PageIndexAPIError(
+                f"Failed to cancel extract job: {response.text}",
+                status_code=response.status_code)
+        return response.json()
+
+    def delete_extract(self, job_id: str) -> Dict[str, Any]:
+        """
+        Delete an extract job and its result.
+
+        Returns:
+            dict: {"id": ..., "deleted": True}
+        """
+        response = self._http.delete(
+            f"{self.BASE_URL}/extract/{_enc(job_id)}/",
+            headers=self._headers(),
+            timeout=30
+        )
+        if response.status_code != 200:
+            raise PageIndexAPIError(
+                f"Failed to delete extract job: {response.text}",
                 status_code=response.status_code)
         return response.json()

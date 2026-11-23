@@ -3,14 +3,56 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _llm_key(monkeypatch):
-    """Deterministic key presence for every test; missing-key tests delenv."""
+    """Deterministic key presence for every test; missing-key tests delenv.
+    claude-code/ index calls run in processes unless a test opens workflows."""
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("PAGEINDEX_CLAUDE_CODE_WORKFLOW", "0")
+    monkeypatch.delenv("PAGEINDEX_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("PAGEINDEX_EXTRACT_API_KEY", raising=False)
 
 
-def build_pdf(page_texts):
-    """Build a minimal, uncompressed PDF (one Helvetica line per page) whose
-    text PyPDF2 can extract. Returns the PDF file bytes."""
+@pytest.fixture(autouse=True)
+def _no_published_model_map(monkeypatch):
+    """No test downloads LiteLLM's published model map; the tests of that
+    download fake it (test_local_chat._publish)."""
+    from pageindex import utils
+    monkeypatch.setattr(utils, "_MAP_SET_BY_USER", True)
+
+
+@pytest.fixture(autouse=True)
+def _no_refusals_remembered(monkeypatch):
+    """Each test starts with no server refusal remembered for the process."""
+    from pageindex import utils
+    monkeypatch.setattr(utils, "_refusals", {})
+
+
+def exit_code_in_forked_child(check, timeout=5):
+    """``check()`` run in a forked child of this process: exit code 0 when it
+    returns true, 1 when false or raising, minus SIGALRM when it hangs."""
+    import os
+    import signal
+    import warnings
+    if not hasattr(os, "fork"):
+        pytest.skip("fork is POSIX only")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)  # forks a threaded process
+        pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            signal.alarm(timeout)
+            code = 0 if check() else 1
+        finally:
+            os._exit(code)
+    return os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+
+
+def build_pdf(page_texts, font="<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"):
+    """Build a minimal, uncompressed PDF (one line per page, a page's
+    (x, y, size, text) lines, or a page's raw content stream as bytes, in
+    ``font``, Helvetica by default) whose text PyPDF2 can extract. Returns
+    the PDF file bytes."""
     n = len(page_texts)
     objects = []
     kids = " ".join(f"{3 + i} 0 R" for i in range(n))
@@ -23,11 +65,17 @@ def build_pdf(page_texts):
             f"/Resources << /Font << /F1 {font_obj} 0 R >> >> "
             f"/Contents {3 + n + i} 0 R >>".encode()
         )
-    for text in page_texts:
-        safe = text.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
-        stream = f"BT /F1 12 Tf 72 720 Td ({safe}) Tj ET".encode()
+    for page in page_texts:
+        if isinstance(page, bytes):
+            stream = page
+        else:
+            parts = []
+            for x, y, size, text in [(72, 720, 12, page)] if isinstance(page, str) else page:
+                safe = text.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
+                parts.append(f"BT /F1 {size} Tf {x} {y} Td ({safe}) Tj ET")
+            stream = " ".join(parts).encode()
         objects.append(b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream))
-    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    objects.append(font.encode())
 
     out = bytearray(b"%PDF-1.4\n")
     offsets = []
@@ -51,3 +99,12 @@ def sample_pdf(tmp_path):
     path.write_bytes(build_pdf(["Hello page one about apples",
                                 "Second page about bananas"]))
     return str(path)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_vision_calls(request, monkeypatch):
+    """Indexing fixtures stub the tree builder; keep the vision pre-pass
+    offline too. Its own suite exercises detection and transcription."""
+    if request.node.path.name != "test_vision_transcribe.py":
+        monkeypatch.setattr("pageindex.vision.transcribe_sparse_pages",
+                            lambda file_path, texts, **kwargs: texts)

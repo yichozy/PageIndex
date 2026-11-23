@@ -78,7 +78,7 @@ def test_toc_builds_tree_from_bookmarks(tmp_path):
     assert meta["description"] is None
     # Formatted tree keeps the chapter start pages.
     formatted = api.get_tree(doc_id)["result"]
-    assert formatted[0]["page_index"] == 2
+    assert formatted[0]["start_index"] == 2
 
 
 def test_toc_storage_purity(tmp_path):
